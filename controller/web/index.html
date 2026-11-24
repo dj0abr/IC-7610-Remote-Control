@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kmcontrol · IC-7610</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main class="console">
+    <header class="masthead">
+      <h1>IC-7610 <span>kmcontrol</span></h1>
+    </header>
+
+    <section class="receiver panel" aria-labelledby="receiver-title">
+      <header class="receiver-header">
+        <h2 id="receiver-title">Empfang</h2>
+        <div class="receiver-actions">
+          <output id="status" role="status" aria-live="polite">Verbinde …</output>
+          <button id="audio-toggle" type="button" aria-pressed="false" disabled>Audio einschalten</button>
+        </div>
+      </header>
+      <div class="receiver-body">
+        <div class="frequency">
+          <label for="main-frequency">MAIN</label>
+          <div><output id="main-frequency">—</output> <span>MHz</span></div>
+        </div>
+        <div class="receiver-details">
+          <span><label for="sub-frequency">SUB</label> <output id="sub-frequency">—</output></span>
+          <output id="audio-error" role="status" hidden></output>
+        </div>
+      </div>
+    </section>
+
+    <div class="workspace">
+      <aside class="sidebar panel" aria-labelledby="settings-title">
+        <h2 id="settings-title">Einstellungen</h2>
+        <details id="receive-menu">
+          <summary>Empfang</summary>
+          <div class="settings">
+            <label for="band">Band</label>
+            <select id="band" disabled></select>
+            <output id="band-range" for="band"></output>
+            <label for="sideband">Seitenband</label>
+            <select id="sideband" disabled>
+              <option>USB</option>
+              <option>LSB</option>
+            </select>
+            <label class="slider-control">Lautstärke
+              <output id="volume-value" for="volume">—</output>
+              <input id="volume" type="range" min="0" max="100" value="0" disabled>
+            </label>
+          </div>
+        </details>
+        <details>
+          <summary>Wasserfall</summary>
+          <div class="settings">
+            <label class="slider-control">Untere Schwelle
+              <output id="lower-value" for="lower">−120 dBFS</output>
+              <input id="lower" type="range" min="-160" max="-1" value="-120" disabled>
+            </label>
+            <label class="slider-control">Obere Schwelle
+              <output id="upper-value" for="upper">−25 dBFS</output>
+              <input id="upper" type="range" min="-159" max="0" value="-25" disabled>
+            </label>
+            <label for="color">Diagrammfarbe</label>
+            <select id="color">
+              <option value="blue">Blau</option>
+              <option value="red">Rot</option>
+              <option value="green">Grün</option>
+            </select>
+          </div>
+        </details>
+        <details id="setup">
+          <summary>Setup</summary>
+          <div class="settings setup-settings">
+            <div class="setup-field">
+              <label for="radio-ip">IP des IC-7610</label>
+              <input id="radio-ip" maxlength="15" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="radio-ip-error" disabled>
+              <small id="radio-ip-error" class="setting-error" role="status" hidden></small>
+            </div>
+            <div class="setup-field">
+              <label for="pi-ip">IP des Raspberry Pi</label>
+              <input id="pi-ip" maxlength="15" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="pi-ip-error" disabled>
+              <small id="pi-ip-error" class="setting-error" role="status" hidden></small>
+            </div>
+            <div class="setup-field">
+              <label for="browser-speaker">Wiedergabegerät</label>
+              <select id="browser-speaker">
+                <option value="">Systemstandard</option>
+              </select>
+            </div>
+            <div id="browser-device-access" hidden>
+              <button id="allow-audio-devices" type="button" aria-describedby="audio-device-hint"></button>
+              <small id="audio-device-hint" hidden>Der Browser fragt nach Mikrofonzugriff, um die Soundkarten aufzulisten. Der Mikrofonstream wird direkt danach geschlossen.</small>
+            </div>
+            <small id="browser-device-error" class="setting-error" role="status" hidden></small>
+          </div>
+        </details>
+      </aside>
+
+      <div class="charts">
+        <section id="overview" class="chart panel" aria-labelledby="fullband-title">
+          <header>
+            <h2 id="fullband-title">Fullband</h2>
+            <span id="fullband-range"></span>
+            <span class="plot-units">dBFS · MHz</span>
+          </header>
+          <canvas data-spectrum aria-label="Spektrum des ausgewählten Bands"></canvas>
+          <div class="waterfall-stack">
+            <canvas data-waterfall aria-label="Wasserfall des ausgewählten Bands"></canvas>
+            <canvas data-waterfall-overlay aria-hidden="true"></canvas>
+          </div>
+        </section>
+
+        <section id="zoom" class="chart panel" aria-labelledby="zoom-title">
+          <header>
+            <h2 id="zoom-title">Zoom</h2>
+            <span id="zoom-range">MAIN ±30 kHz</span>
+            <span class="plot-units">dBFS · MHz</span>
+          </header>
+          <canvas data-spectrum aria-label="Spektrum um MAIN"></canvas>
+          <div class="waterfall-stack">
+            <canvas data-waterfall aria-label="Wasserfall um MAIN"></canvas>
+            <canvas data-waterfall-overlay aria-hidden="true"></canvas>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+</body>
+</html>

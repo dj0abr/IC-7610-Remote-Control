@@ -1,0 +1,8 @@
+.nfs*
+__pycache__/
+/controller/build/
+/controller/ic7610-status
+/controller/kmcontrol-backend
+/controller/kmcontrol-web
+/raspberry/ftdi/
+/raspberry/iq-test
