@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rx-audio-filter.hpp"
+#include "rx-notch.hpp"
 
 #include <speex/speex_preprocess.h>
 
@@ -28,6 +28,10 @@ public:
     void tune(int offsetHz, Sideband sideband);
     void setFrequencyOffset(int offsetHz);
     bool setRxFilter(RxFilterSettings settings);
+    bool autoNotchAvailable() const { return m_notch.autoAvailable(); }
+    void setNotch(RxNotch::Mode mode, int frequency) { m_notch.set(mode, frequency); }
+    int detectedNotchHz() const { return m_notch.detectedHz(); }
+    void clearNotchDetection() { m_notch.clearDetection(); }
     void setNoiseReduction(int percent);
     std::span<const float> process(const char* data, int bytes);
 
@@ -42,7 +46,9 @@ private:
     firdecim_crcf m_second;
     firdecim_crcf m_third;
     RxAudioFilter m_filter;
+    RxNotch m_notch;
     firinterp_rrrf m_interpolator;
+    int m_offsetHz = 0;
     Sideband m_sideband = Sideband::Lsb;
     static constexpr unsigned int voiceBlockSamples = RxAudioFilter::sampleRate / 50;
     std::unique_ptr<SpeexPreprocessState, decltype(&speex_preprocess_state_destroy)>

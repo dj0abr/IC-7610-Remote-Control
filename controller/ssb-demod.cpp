@@ -91,6 +91,7 @@ void SsbDemodulator::tune(int offsetHz, Sideband sideband)
     firinterp_rrrf_reset(m_interpolator);
     m_sideband = sideband;
     m_filter.reset();
+    m_notch.reset();
     resetNoiseReduction();
     m_voiceCount = 0;
     m_voicePower = minimumVoicePower;
@@ -101,12 +102,22 @@ void SsbDemodulator::tune(int offsetHz, Sideband sideband)
 
 void SsbDemodulator::setFrequencyOffset(int offsetHz)
 {
+    if (offsetHz != m_offsetHz)
+    {
+        m_offsetHz = offsetHz;
+        m_notch.clearDetection();
+    }
     nco_crcf_set_frequency(m_oscillator, radiansPerCycle * offsetHz / inputRate);
 }
 
 bool SsbDemodulator::setRxFilter(RxFilterSettings settings)
 {
-    return m_filter.set(settings);
+    if (!m_filter.set(settings))
+    {
+        return false;
+    }
+    m_notch.setPassband(settings);
+    return true;
 }
 
 void SsbDemodulator::setNoiseReduction(int percent)
@@ -224,7 +235,7 @@ std::span<const float> SsbDemodulator::process(const char* data, int bytes)
         {
             sample = std::conj(sample);
         }
-        m_voiceBlock[m_voiceCount++] = detectAudio(m_filter.execute(sample));
+        m_voiceBlock[m_voiceCount++] = detectAudio(m_notch.execute(m_filter.execute(sample)));
         if (m_voiceCount == voiceBlockSamples)
         {
             processVoiceBlock();

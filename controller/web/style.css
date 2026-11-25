@@ -235,6 +235,27 @@ h1, h2 { margin: 0; }
   border: 2px solid #fff;
 }
 .filter-range { display: flex; justify-content: space-between; color: var(--muted); font: .65rem var(--mono); }
+.notch-settings { display: grid; gap: 5px; padding-top: 8px; border-top: 1px solid var(--border); }
+.notch-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.notch-modes legend { padding: 0; color: var(--muted); }
+.notch-modes label { display: inline-flex; align-items: center; gap: 4px; padding-block: 4px; cursor: pointer; }
+.notch-modes input { margin: 0; }
+.notch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+}
+.notch-row output { color: #e6eef6; font: .68rem var(--mono); white-space: nowrap; }
 #filter-note { margin: 0; padding-top: 8px; border-top: 1px solid var(--border); color: var(--muted); font-size: .73rem; }
 .setup-settings { gap: 10px; }
 .setup-field { display: grid; gap: 5px; min-width: 0; }
@@ -256,14 +277,14 @@ h1, h2 { margin: 0; }
 .slider-control output { color: #e6eef6; font: .68rem var(--mono); white-space: nowrap; }
 
 input, select, button { font: inherit; }
-input:not([type="range"]), select, button {
+input:not([type="range"], [type="radio"]), select, button {
   color: inherit;
   background: #1a2b38;
   border: 1px solid #3a5368;
   border-radius: 5px;
   padding: 6px 8px;
 }
-input:not([type="range"]), select { width: 100%; min-width: 0; }
+input:not([type="range"], [type="radio"]), select { width: 100%; min-width: 0; }
 button:not(:disabled) { cursor: pointer; }
 button:not(:disabled):hover { border-color: var(--accent); }
 :disabled { opacity: .53; }

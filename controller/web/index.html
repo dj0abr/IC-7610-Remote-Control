@@ -98,6 +98,22 @@
               <output id="nr-value" for="nr">—</output>
               <input id="nr" type="range" min="0" max="100" step="1" value="0" disabled>
             </label>
+            <div class="notch-settings">
+              <fieldset id="notch-mode" class="notch-modes" disabled>
+                <legend>Notch</legend>
+                <label><input type="radio" name="notch-mode" value="off" checked> Aus</label>
+                <label><input type="radio" name="notch-mode" value="manual"> Man</label>
+                <label><input type="radio" name="notch-mode" value="auto"> Auto</label>
+              </fieldset>
+              <label id="notch-manual" class="slider-control" hidden>Notch-Frequenz
+                <output id="notch-hz-value" for="notch-hz">—</output>
+                <input id="notch-hz" type="range" min="100" max="4000" step="1" value="1000" disabled>
+              </label>
+              <div id="notch-auto" class="notch-row" hidden>
+                <span id="notch-detected-label">Erkannte Frequenz</span>
+                <output id="notch-detected" aria-labelledby="notch-detected-label" aria-live="off">—</output>
+              </div>
+            </div>
             <p id="filter-note">Der Durchlassbereich ist im Zoom markiert.</p>
             <small id="filter-error" class="setting-error" role="status" hidden></small>
           </div>

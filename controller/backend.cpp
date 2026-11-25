@@ -9,6 +9,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSettings>
+#include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QThread>
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <csignal>
 #include <limits>
+#include <numeric>
 #include <span>
 
 namespace
@@ -38,6 +40,9 @@ void requestStop(int)
 }
 
 using Sideband = SsbDemodulator::Sideband;
+using NotchMode = RxNotch::Mode;
+
+const QStringList notchModes{QStringLiteral("off"), QStringLiteral("manual"), QStringLiteral("auto")};
 
 QString sidebandKey(const Band* band)
 {
@@ -111,6 +116,14 @@ public:
         }
         m_nrPercent = std::clamp(m_settings.value(QStringLiteral("audio/nr_percent"), 0).toInt(), 0, 100);
         m_demodulator.setNoiseReduction(m_nrPercent);
+        const auto mode = notchModes.indexOf(m_settings.value(QStringLiteral("audio/notch_mode")).toString());
+        if (mode >= 0 && (mode != static_cast<int>(NotchMode::Auto) || m_demodulator.autoNotchAvailable()))
+        {
+            m_notchMode = static_cast<NotchMode>(mode);
+        }
+        m_notchHz = std::clamp(m_settings.value(QStringLiteral("audio/notch_hz"), RxNotch::defaultHz).toInt(),
+                               RxNotch::minimumHz, RxNotch::maximumHz);
+        m_demodulator.setNotch(m_notchMode, m_notchHz);
         m_pi.setReadBufferSize(2 * 1024 * 1024);
         m_retry.setSingleShot(true);
         m_retry.setInterval(1000);
@@ -317,7 +330,8 @@ private:
                 state(QStringLiteral("error"), QStringLiteral("Unbekannter Bandbefehl"));
                 continue;
             }
-            if (m_desired && m_desired != band)
+            const bool newBand = m_desired != band;
+            if (m_desired && newBand)
             {
                 QMetaObject::invokeMethod(m_mainControl, "bandChanged", Qt::QueuedConnection, Q_ARG(quint64, m_mainSession));
             }
@@ -326,6 +340,10 @@ private:
             send({{QStringLiteral("type"), QStringLiteral("sideband")},
                   {QStringLiteral("band"), band->id},
                   {QStringLiteral("mode"), sidebandMode(m_sideband)}});
+            if (newBand)
+            {
+                tuneMain(band->lowHz, band->highHz);
+            }
             if (m_pi.state() == QAbstractSocket::UnconnectedState)
             {
                 connectPi();
@@ -383,6 +401,10 @@ private:
             setMainFrequency(0, false);
             sendMainStatus(QStringLiteral("MAIN: LAN-CI-V verbinden …"));
             startMainControl();
+            if (m_desired)
+            {
+                tuneMain(m_desired->lowHz, m_desired->highHz);
+            }
         }
         if (m_host != pi)
         {
@@ -426,12 +448,36 @@ private:
         }
     }
 
+    int detectedNotchHz() const
+    {
+        return m_demodulating ? m_demodulator.detectedNotchHz() : 0;
+    }
+
+    static QJsonValue notchFrequencyValue(int frequency)
+    {
+        return frequency ? QJsonValue(frequency) : QJsonValue();
+    }
+
+    void publishNotchFrequency()
+    {
+        const int frequency = detectedNotchHz();
+        if (frequency != m_reportedNotchHz)
+        {
+            m_reportedNotchHz = frequency;
+            send({{QStringLiteral("type"), QStringLiteral("notch-frequency")},
+                  {QStringLiteral("hz"), notchFrequencyValue(frequency)}});
+        }
+    }
+
     void sendRxFilter(const QJsonValue& requestId = {}, const QString& text = {})
     {
         send({{QStringLiteral("type"), QStringLiteral("rx-filter")},
               {QStringLiteral("low_hz"), m_rxFilter.lowHz},
               {QStringLiteral("high_hz"), m_rxFilter.highHz},
               {QStringLiteral("nr_percent"), m_nrPercent},
+              {QStringLiteral("notch_mode"), notchModes.at(static_cast<int>(m_notchMode))},
+              {QStringLiteral("notch_hz"), m_notchHz},
+              {QStringLiteral("notch_detected_hz"), notchFrequencyValue(detectedNotchHz())},
               {QStringLiteral("request_id"), requestId},
               {QStringLiteral("text"), text}});
     }
@@ -449,10 +495,33 @@ private:
             sendRxFilter(requestId, QStringLiteral("Filtergrenzen 100–4000 Hz, mindestens 500 Hz Abstand. NR 0–100 %."));
             return;
         }
+        const auto mode = request.contains(QStringLiteral("notch_mode"))
+            ? notchModes.indexOf(request.value(QStringLiteral("notch_mode")).toString())
+            : static_cast<int>(m_notchMode);
+        const int notchHz = request.contains(QStringLiteral("notch_hz"))
+            ? request.value(QStringLiteral("notch_hz")).toInt(-1) : m_notchHz;
+        if (mode < 0 || notchHz < RxNotch::minimumHz || notchHz > RxNotch::maximumHz)
+        {
+            sendRxFilter(requestId, QStringLiteral("Ungültiger Notch-Modus oder Frequenz außerhalb 100–4000 Hz."));
+            return;
+        }
+        if (mode == static_cast<int>(NotchMode::Auto) && !m_demodulator.autoNotchAvailable())
+        {
+            sendRxFilter(requestId, QStringLiteral("Auto-Notch ist derzeit nicht verfügbar."));
+            return;
+        }
         if (!m_demodulator.setRxFilter(settings))
         {
             sendRxFilter(requestId, QStringLiteral("Der RX-Filter konnte nicht eingestellt werden."));
             return;
+        }
+        if (mode != static_cast<int>(m_notchMode) || notchHz != m_notchHz)
+        {
+            m_notchMode = static_cast<NotchMode>(mode);
+            m_notchHz = notchHz;
+            m_demodulator.setNotch(m_notchMode, notchHz);
+            m_settings.setValue(QStringLiteral("audio/notch_mode"), notchModes.at(mode));
+            m_settings.setValue(QStringLiteral("audio/notch_hz"), notchHz);
         }
         if (settings != m_rxFilter || percent != m_nrPercent)
         {
@@ -465,6 +534,7 @@ private:
             updateDemodulator(false);
         }
         sendRxFilter(requestId);
+        publishNotchFrequency();
     }
 
     void setVolume(int percent)
@@ -699,7 +769,7 @@ private:
     void updateDemodulator(bool reset = true)
     {
         const qint64 offset = m_mainHz - m_center;
-        const bool receiving = !m_rxPaused && m_streamAudio && m_active && m_mainHz > 0 &&
+        const bool receiving = !m_rxPaused && m_streamAudio && m_active && m_active == m_desired && m_mainHz > 0 &&
             std::abs(offset) + m_rxFilter.highHz <= Spectrum::usableHalfWidthHz;
         if (reset || receiving != m_demodulating)
         {
@@ -721,15 +791,17 @@ private:
             }
         }
         m_demodulating = receiving;
+        publishNotchFrequency();
     }
 
-    void tuneMain(qint64 hz)
+    void tuneMain(qint64 lowHz, qint64 highHz)
     {
         ++m_mainRevision;
-        setMainFrequency(hz, false);
+        const qint64 frequency = m_mainHz >= lowHz && m_mainHz <= highHz ? m_mainHz : std::midpoint(lowHz, highHz);
+        setMainFrequency(frequency, false);
         sendMainStatus(QStringLiteral("MAIN wird mit dem IC-7610 synchronisiert …"));
         QMetaObject::invokeMethod(m_mainControl, "tune", Qt::QueuedConnection,
-                                  Q_ARG(qint64, hz), Q_ARG(quint64, m_mainRevision));
+                                  Q_ARG(qint64, lowHz), Q_ARG(qint64, highHz), Q_ARG(quint64, m_mainRevision));
     }
 
     void requestMain(const QJsonObject& request)
@@ -741,7 +813,8 @@ private:
             sendMainStatus(QStringLiteral("MAIN-Frequenz liegt außerhalb des aktiven Spektrums."));
             return;
         }
-        tuneMain(static_cast<qint64>(hz));
+        const auto frequency = static_cast<qint64>(hz);
+        tuneMain(frequency, frequency);
     }
 
     void stepMain(int steps)
@@ -755,7 +828,8 @@ private:
         const qint64 allowedSteps = std::clamp<qint64>(steps, minSteps, maxSteps);
         if (allowedSteps != 0)
         {
-            tuneMain(m_mainHz + allowedSteps * mainStepHz);
+            const qint64 frequency = m_mainHz + allowedSteps * mainStepHz;
+            tuneMain(frequency, frequency);
         }
     }
 
@@ -1024,11 +1098,14 @@ private:
         if (std::all_of(data, data + length, [](char byte) { return byte == 0; }))
         {
             m_samples.clear();
+            m_demodulator.clearNotchDetection();
+            publishNotchFrequency();
             return;
         }
         if (m_demodulating)
         {
             sendBrowserAudio(m_demodulator.process(data, length));
+            publishNotchFrequency();
         }
 
         // The hop is set by the I/Q sample clock, independently of TCP block boundaries.
@@ -1061,6 +1138,9 @@ private:
     Sideband m_sideband = Sideband::Lsb;
     RxFilterSettings m_rxFilter;
     int m_nrPercent = 0;
+    NotchMode m_notchMode = NotchMode::Off;
+    int m_notchHz = RxNotch::defaultHz;
+    int m_reportedNotchHz = 0;
     SsbDemodulator m_demodulator;
     QThread m_mainThread;
     MainControl* m_mainControl = new MainControl;

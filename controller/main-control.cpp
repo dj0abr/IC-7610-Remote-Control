@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <numeric>
 #include <utility>
 
 using namespace std::chrono_literals;
@@ -301,11 +302,11 @@ bool MainControl::processTx(Clock::time_point now, bool settingWritePending)
     return true;
 }
 
-void MainControl::tune(qint64 hz, quint64 revision)
+void MainControl::tune(qint64 lowHz, qint64 highHz, quint64 revision)
 {
     if (m_timer->isActive())
     {
-        m_requested = TuneRequest{hz, revision};
+        m_requested = TuneRequest{lowHz, highHz, revision};
     }
 }
 
@@ -404,7 +405,16 @@ qint64 MainControl::writeFrequency(const TuneRequest& request)
 {
     try
     {
-        return static_cast<qint64>(m_radio->setMainFrequency(static_cast<std::uint64_t>(request.hz)));
+        if (request.lowHz != request.highHz)
+        {
+            const auto current = static_cast<qint64>(m_radio->mainFrequency());
+            if (request.matches(current))
+            {
+                return current;
+            }
+        }
+        const auto target = std::midpoint(request.lowHz, request.highHz);
+        return static_cast<qint64>(m_radio->setMainFrequency(static_cast<std::uint64_t>(target)));
     }
     catch (const icom::CivRejected& error)
     {
@@ -440,7 +450,7 @@ void MainControl::updateRadio()
         {
             return;
         }
-        if (now >= m_nextPttRead || settingWritePending)
+        if (now >= m_nextPttRead || (!m_externalTx && (settingWritePending || m_requested)))
         {
             m_externalTx = m_radio->transmitting();
             m_nextPttRead = m_clock.elapsed() + 120;
@@ -507,7 +517,7 @@ void MainControl::updateRadio()
         }
         if (requested)
         {
-            const QString status = frequency == requested->hz
+            const QString status = requested->matches(frequency)
                 ? QStringLiteral("MAIN-Frequenz am IC-7610 bestätigt")
                 : QStringLiteral("IC-7610 meldet abweichende MAIN-Frequenz");
             emit statusChanged(m_session, m_completedRevision, status);

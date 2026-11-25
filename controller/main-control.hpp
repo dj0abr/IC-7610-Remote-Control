@@ -29,7 +29,7 @@ public:
 public slots:
     void start(const QString& address, quint64 session);
     void stop();
-    void tune(qint64 hz, quint64 revision);
+    void tune(qint64 lowHz, qint64 highHz, quint64 revision);
     void setRadioSetting(quint64 session, int index, int value);
     void bandChanged(quint64 session);
 
@@ -44,8 +44,11 @@ signals:
 private:
     struct TuneRequest
     {
-        qint64 hz;
+        qint64 lowHz;
+        qint64 highHz;
         quint64 revision;
+
+        bool matches(qint64 frequency) const { return frequency >= lowHz && frequency <= highHz; }
     };
 
     void updateRadio();

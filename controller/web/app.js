@@ -9,6 +9,11 @@ const volume = element('volume');
 const filterLower = element('filter-lower');
 const filterUpper = element('filter-upper');
 const filterNoise = element('nr');
+const notchModes = element('notch-mode');
+const notchFrequency = element('notch-hz');
+const notchManual = element('notch-manual');
+const notchAuto = element('notch-auto');
+const notchDetected = element('notch-detected');
 const filterPresets = document.querySelectorAll('.filter-presets button');
 const filterError = element('filter-error');
 const rfPower = element('rf-power');
@@ -89,6 +94,7 @@ let halfSpan = 30000;
 let spectrumLive = false;
 let setupState = null;
 let rxFilter = null;
+let detectedNotchHz = null;
 let filterTimer = 0;
 let filterRevision = 0;
 let nextSetupId = 0;
@@ -439,7 +445,26 @@ function paintFilterRange(control) {
   control.style.setProperty('--fill', `${span > 0 ? (Number(control.value) - min) / span * 100 : 0}%`);
 }
 
+function renderNotch() {
+  const mode = rxFilter?.notch_mode ?? 'off';
+  notchModes.disabled = !rxFilter?.notch_mode;
+  for (const radio of notchModes.elements) {
+    radio.checked = radio.value === mode;
+  }
+  notchManual.hidden = mode !== 'manual';
+  notchFrequency.disabled = notchManual.hidden;
+  notchAuto.hidden = mode !== 'auto';
+  if (!notchManual.hidden) {
+    notchFrequency.value = rxFilter.notch_hz;
+    element('notch-hz-value').value = `${rxFilter.notch_hz.toLocaleString('de-DE')} Hz`;
+    paintFilterRange(notchFrequency);
+  }
+  notchDetected.value = !audioEnabled ? 'Audio aus' :
+    detectedNotchHz == null ? '—' : `${detectedNotchHz.toLocaleString('de-DE')} Hz`;
+}
+
 function renderFilter() {
+  renderNotch();
   const sideband = modeSelect.value;
   element('filter-mode').textContent = sideband ? `MAIN · ${sideband}-Filter` : 'MAIN · RX-Filter';
   for (const control of [filterLower, filterUpper, filterNoise, ...filterPresets]) {
@@ -481,6 +506,9 @@ function changeFilter(patch, delay = 100) {
     return;
   }
   clearTimeout(filterTimer);
+  if ('notch_mode' in patch || 'low_hz' in patch || 'high_hz' in patch) {
+    detectedNotchHz = null;
+  }
   rxFilter = {...rxFilter, ...patch};
   const request = {op: 'rx_filter', ...rxFilter, request_id: ++filterRevision};
   filterError.hidden = true;
@@ -496,8 +524,9 @@ function installFilter(message) {
   if (message.request_id != null && message.request_id !== filterRevision) {
     return;
   }
-  const {low_hz, high_hz, nr_percent} = message;
-  rxFilter = {low_hz, high_hz, nr_percent};
+  const {low_hz, high_hz, nr_percent, notch_mode, notch_hz, notch_detected_hz} = message;
+  rxFilter = {low_hz, high_hz, nr_percent, notch_mode, notch_hz};
+  detectedNotchHz = notch_detected_hz;
   filterError.textContent = message.text;
   filterError.hidden = !message.text;
   renderFilter();
@@ -509,6 +538,7 @@ function showAudioError(text) {
 }
 
 function renderAudioButton() {
+  renderNotch();
   audioButton.disabled = audioStarting || !setupState || (requestingDevices && !audioEnabled);
   audioButton.textContent = audioStarting ? 'Audio startet …' : audioEnabled ? 'Audio ausschalten' : 'Audio einschalten';
   audioButton.setAttribute('aria-pressed', String(audioEnabled));
@@ -834,6 +864,12 @@ function control(message) {
     case 'rx-filter':
       installFilter(message);
       break;
+    case 'notch-frequency':
+      if (rxFilter?.notch_mode === 'auto') {
+        detectedNotchHz = message.hz;
+        renderNotch();
+      }
+      break;
     case 'setup-result':
       setupResult(message);
       break;
@@ -931,6 +967,7 @@ function connect() {
     updateTx({phase: 'offline', ready: false});
     clearTimeout(filterTimer);
     rxFilter = null;
+    detectedNotchHz = null;
     filterError.hidden = true;
     renderFilter();
     updateRfPower(null);
@@ -962,6 +999,9 @@ modeSelect.addEventListener('change', () => {
 filterLower.addEventListener('input', () => changeFilter({low_hz: Number(filterLower.value)}));
 filterUpper.addEventListener('input', () => changeFilter({high_hz: Number(filterUpper.value)}));
 filterNoise.addEventListener('input', () => changeFilter({nr_percent: Number(filterNoise.value)}));
+notchModes.addEventListener('change', event => changeFilter({notch_mode: event.target.value}, 0));
+notchFrequency.addEventListener('input', () => changeFilter({notch_hz: Number(notchFrequency.value)}));
+notchFrequency.addEventListener('change', () => changeFilter({notch_hz: Number(notchFrequency.value)}, 0));
 for (const button of filterPresets) {
   button.addEventListener('click', () => {
     const bandwidth = Number(button.dataset.bandwidth);
