@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -14,6 +16,9 @@ inline constexpr char radioAddress[] = "192.168.10.133";
 inline constexpr int maxRfPowerLevel = 255;
 inline constexpr int txAudioRate = 16000;
 inline constexpr int txAudioBytes = txAudioRate / 50 * 2;
+inline constexpr auto txMeterTimeout = std::chrono::milliseconds(12);
+
+enum class TxMeter : std::uint8_t { OutputPower = 0x11, Swr = 0x12 };
 
 class CivRejected : public std::runtime_error
 {
@@ -35,6 +40,8 @@ public:
     std::uint64_t mainFrequency();
     std::uint64_t setMainFrequency(std::uint64_t hz);
     int rfPower();
+    std::optional<int> readMainSMeter();
+    std::optional<int> readTxMeter(TxMeter meter, std::chrono::milliseconds timeout);
     void setRfPower(int level);
     void setMicGain50Percent();
     int compressor();

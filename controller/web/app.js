@@ -29,6 +29,15 @@ const pttButton = element('ptt');
 const pttModeControl = element('ptt-mode');
 const pttHint = element('ptt-hint');
 const txIndicator = element('tx-state');
+const rxMeter = element('rx-meter');
+const rxMeterBar = element('rx-meter-bar');
+const rxMeterValue = element('rx-meter-value');
+const txMeters = element('tx-meters');
+const txPower = element('tx-output-power');
+const txSwr = element('tx-swr');
+const txPowerBar = element('tx-power-bar');
+const txSwrBar = element('tx-swr-bar');
+const txMeterFormat = new Intl.NumberFormat('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1});
 const txError = element('tx-error');
 const browserSpeaker = element('browser-speaker');
 const browserMicrophone = element('browser-microphone');
@@ -279,9 +288,58 @@ function selectMicrophone() {
   }
 }
 
+function meterValue(raw, points) {
+  for (let i = 1; i < points.length; ++i) {
+    const [upper, high] = points[i];
+    if (raw <= upper) {
+      const [lower, low] = points[i - 1];
+      return low + (high - low) * (raw - lower) / (upper - lower);
+    }
+  }
+  return null;
+}
+
+function renderRxMeter(level = null) {
+  // CI-V 15 02 uses S0 = 0, S9 = 120 and S9 +60 dB = 241.
+  const maximum = 241;
+  rxMeterBar.style.setProperty('--meter-level', `${Math.min(level ?? 0, maximum) / maximum * 100}%`);
+  const aboveS9 = Math.round((Math.min(level, maximum) - 120) * 60 / (maximum - 120));
+  rxMeterValue.textContent = level === null ? '—' :
+    aboveS9 <= 0 ? `S${Math.min(9, Math.round(level * 9 / 120))}` :
+    `S9 +${aboveS9} dB`;
+}
+
+function renderTxMeters({po = null, swr = null} = {}) {
+  // CI-V reports positions on the Icom's meter scales (reference, commands 15 11 and 15 12).
+  const watts = po === null ? null : meterValue(po, [[0, 0], [143, 50], [212, 100]]);
+  const ratio = swr === null ? null : meterValue(swr, [[0, 1], [48, 1.5], [80, 2], [120, 3]]);
+  const hasSwr = po > 0 && swr !== null;
+  const powerLevel = po === null ? 0 : watts ?? 100;
+  const swrLevel = hasSwr ? ((ratio ?? 3) - 1) * 50 : 0;
+  txPowerBar.style.setProperty('--meter-level', `${powerLevel}%`);
+  txSwrBar.style.setProperty('--meter-level', `${swrLevel}%`);
+  if (hasSwr) {
+    const value = ratio ?? Infinity;
+    txSwrBar.dataset.swrRange = value < 1.8 ? 'low' : value <= 2.5 ? 'medium' : 'high';
+  } else {
+    delete txSwrBar.dataset.swrRange;
+  }
+  txPower.textContent = po === null ? '—' : po > 212 ? '≥ 100 W' : watts === 0 ? '0 W' :
+    `≈ ${watts < 10 ? txMeterFormat.format(watts) : Math.round(watts)} W`;
+  txSwr.textContent = hasSwr ?
+    (swr > 120 ? '> 3:1' : `${txMeterFormat.format(ratio)}:1`) : '—';
+}
+
 function updateTx(message) {
   const previous = tx.phase;
   tx = message;
+  if (previous !== tx.phase) {
+    const showTxMeters = ['starting', 'tx', 'ending'].includes(tx.phase);
+    rxMeter.hidden = showTxMeters;
+    txMeters.hidden = !showTxMeters;
+    renderRxMeter();
+    renderTxMeters();
+  }
   if (!tx.ready || (tx.phase === 'rx' && (previous !== 'rx' || tx.text))) {
     stopPtt();
   }
@@ -740,6 +798,16 @@ function control(message) {
     case 'tx':
       updateTx(message);
       break;
+    case 'tx-meters':
+      if (tx.phase === 'tx') {
+        renderTxMeters(message);
+      }
+      break;
+    case 'rx-meter':
+      if (tx.phase === 'rx') {
+        renderRxMeter(message.level);
+      }
+      break;
     case 'bands':
       installBands(message);
       break;
@@ -860,7 +928,7 @@ function connect() {
     volume.disabled = true;
     activeBand = null;
     setupState = null;
-    tx = {phase: 'offline', ready: false};
+    updateTx({phase: 'offline', ready: false});
     clearTimeout(filterTimer);
     rxFilter = null;
     filterError.hidden = true;

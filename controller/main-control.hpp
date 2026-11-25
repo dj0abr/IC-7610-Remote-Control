@@ -37,6 +37,8 @@ signals:
     void frequencyChanged(quint64 session, quint64 revision, qint64 hz);
     void statusChanged(quint64 session, quint64 revision, const QString& text);
     void radioSettingChanged(quint64 session, int index, int value, const QString& text);
+    void rxMeterChanged(quint64 session, int level);
+    void txMetersChanged(quint64 session, int power, int swr);
     void txChanged(quint64 session, const QString& phase, bool ready, const QString& text);
 
 private:
@@ -79,6 +81,7 @@ private:
     void cancelPtt(quint32 id);
     bool processTx(Clock::time_point now, bool settingWritePending);
     void finishTx(const QString& text = {});
+    void updateTxMeters(Clock::time_point now, std::chrono::milliseconds timeout = icom::txMeterTimeout);
     void reportTx(const QString& phase, bool ready, const QString& text = {});
 
     QTimer* m_timer;
@@ -94,11 +97,14 @@ private:
     qint64 m_nextRead = 0;
     qint64 m_retryAfter = 0;
     qint64 m_nextPttRead = 0;
+    qint64 m_nextRxMeter = 0;
     bool m_externalTx = false;
     quint32 m_ownedTx = 0;
     Clock::time_point m_txDeadline;
     Clock::time_point m_nextAudio;
     Clock::time_point m_nextTxStatus;
+    Clock::time_point m_nextTxMeter;
+    std::optional<int> m_pendingPo;
     std::mutex m_txMutex;
     TxInput m_input;
     QString m_txPhase;

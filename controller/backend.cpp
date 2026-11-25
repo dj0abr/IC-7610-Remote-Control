@@ -128,6 +128,8 @@ public:
         connect(m_mainControl, &MainControl::frequencyChanged, this, &Backend::updateMainFrequency);
         connect(m_mainControl, &MainControl::statusChanged, this, &Backend::updateMainStatus);
         connect(m_mainControl, &MainControl::radioSettingChanged, this, &Backend::updateRadioSetting);
+        connect(m_mainControl, &MainControl::rxMeterChanged, this, &Backend::updateRxMeter);
+        connect(m_mainControl, &MainControl::txMetersChanged, this, &Backend::updateTxMeters);
         connect(m_mainControl, &MainControl::txChanged, this, &Backend::updateTx);
         m_mainThread.start();
     }
@@ -602,6 +604,25 @@ private:
         send({{QStringLiteral("type"), type},
               {QStringLiteral("value"), value < 0 ? QJsonValue(QJsonValue::Null) : QJsonValue(value)},
               {QStringLiteral("text"), text}});
+    }
+
+    void updateRxMeter(quint64 session, int level)
+    {
+        if (m_gui && session == m_mainSession)
+        {
+            send({{QStringLiteral("type"), QStringLiteral("rx-meter")},
+                  {QStringLiteral("level"), level < 0 ? QJsonValue() : QJsonValue(level)}});
+        }
+    }
+
+    void updateTxMeters(quint64 session, int power, int swr)
+    {
+        if (m_gui && session == m_mainSession)
+        {
+            send({{QStringLiteral("type"), QStringLiteral("tx-meters")},
+                  {QStringLiteral("po"), power < 0 ? QJsonValue() : QJsonValue(power)},
+                  {QStringLiteral("swr"), swr < 0 ? QJsonValue() : QJsonValue(swr)}});
+        }
     }
 
     void updateTx(quint64 session, const QString& phase, bool ready, const QString& text)

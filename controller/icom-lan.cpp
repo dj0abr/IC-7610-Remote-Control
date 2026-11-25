@@ -382,6 +382,12 @@ struct IgnorePacket
     }
 };
 
+class CivTimeout : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct CivReply
 {
     std::span<const Byte> command;
@@ -412,6 +418,21 @@ struct CivReply
                std::equal(command.begin(), command.end(), incoming.begin() + offset);
     }
 };
+
+std::optional<int> decodeCivLevel(std::span<const Byte> bytes)
+{
+    if (bytes.size() == 2)
+    {
+        const int tens = bytes[1] >> 4;
+        const int units = bytes[1] & 0x0f;
+        const int level = bytes[0] * 100 + tens * 10 + units;
+        if (tens <= 9 && units <= 9 && level <= 255)
+        {
+            return level;
+        }
+    }
+    return std::nullopt;
+}
 
 std::uint64_t decodeFrequency(std::span<const Byte> bytes)
 {
@@ -638,17 +659,26 @@ public:
     int rfPower()
     {
         const auto bytes = exchangeCiv(std::array<Byte, 2>{0x14, 0x0a}, false, 1, 120ms);
-        if (bytes.size() == 2)
+        if (const auto level = decodeCivLevel(bytes))
         {
-            const int tens = bytes[1] >> 4;
-            const int units = bytes[1] & 0x0f;
-            const int level = bytes[0] * 100 + tens * 10 + units;
-            if (tens <= 9 && units <= 9 && level <= maxRfPowerLevel)
-            {
-                return level;
-            }
+            return *level;
         }
         throw std::runtime_error("Ungültiger RF-POWER-Wert vom IC-7610.");
+    }
+
+    std::optional<int> readMeter(std::span<const Byte> command, std::chrono::milliseconds timeout)
+    {
+        try
+        {
+            return decodeCivLevel(exchangeCiv(command, false, 1, timeout, false));
+        }
+        catch (const CivTimeout&)
+        {
+        }
+        catch (const CivRejected&)
+        {
+        }
+        return std::nullopt;
     }
 
     void setRfPower(int level)
@@ -952,7 +982,7 @@ private:
                               reply.end() - 1);
             }
         }
-        throw std::runtime_error("Keine passende Antwort auf CI-V-Befehl " +
+        throw CivTimeout("Keine passende Antwort auf CI-V-Befehl " +
                                  std::to_string(command.front()) + " (dezimal).");
     }
 
@@ -1033,6 +1063,16 @@ std::uint64_t LanRadio::setMainFrequency(std::uint64_t hz)
 int LanRadio::rfPower()
 {
     return m_impl->radio.rfPower();
+}
+
+std::optional<int> LanRadio::readTxMeter(TxMeter meter, std::chrono::milliseconds timeout)
+{
+    return m_impl->radio.readMeter(std::array<Byte, 2>{0x15, static_cast<Byte>(meter)}, timeout);
+}
+
+std::optional<int> LanRadio::readMainSMeter()
+{
+    return m_impl->radio.readMeter(std::array<Byte, 4>{0x29, 0x00, 0x15, 0x02}, 30ms);
 }
 
 void LanRadio::setRfPower(int level)

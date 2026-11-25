@@ -143,6 +143,12 @@ void MainControl::reportTx(const QString& phase, bool ready, const QString& text
                 setting.nextRead = 0;
             }
         }
+        if (phase != m_txPhase)
+        {
+            m_nextRxMeter = 0;
+            m_pendingPo.reset();
+            m_nextTxMeter = Clock::time_point{};
+        }
         m_txPhase = phase;
         m_txReady = ready;
         m_txText = text;
@@ -166,6 +172,32 @@ void MainControl::finishTx(const QString& text)
     m_ownedTx = 0;
     m_externalTx = false;
     reportTx(QStringLiteral("rx"), m_radio->txAudioReady(), text);
+}
+
+void MainControl::updateTxMeters(Clock::time_point now, std::chrono::milliseconds timeout)
+{
+    if (now < m_nextTxMeter)
+    {
+        return;
+    }
+    if (m_pendingPo)
+    {
+        const auto swr = m_radio->readTxMeter(icom::TxMeter::Swr, timeout);
+        emit txMetersChanged(m_session, *m_pendingPo, swr.value_or(-1));
+        m_pendingPo.reset();
+        m_nextTxMeter = now + 180ms;
+        return;
+    }
+
+    const auto power = m_radio->readTxMeter(icom::TxMeter::OutputPower, timeout);
+    if (power && *power > 0)
+    {
+        // Read SWR on the following tick, while this transmission has RF output.
+        m_pendingPo = *power;
+        return;
+    }
+    emit txMetersChanged(m_session, power.value_or(-1), -1);
+    m_nextTxMeter = now + 180ms;
 }
 
 bool MainControl::processTx(Clock::time_point now, bool settingWritePending)
@@ -212,6 +244,17 @@ bool MainControl::processTx(Clock::time_point now, bool settingWritePending)
                 finishTx(QStringLiteral("Der IC-7610 hat TX beendet."));
             }
             m_nextTxStatus = now + 1s;
+        }
+        else if (now >= m_nextTxMeter)
+        {
+            // Use only the time left before the next audio packet, with a scheduling margin.
+            const auto meterStart = Clock::now();
+            const auto budget = std::min(icom::txMeterTimeout,
+                std::chrono::floor<std::chrono::milliseconds>(m_nextAudio - meterStart - 2ms));
+            if (budget >= 7ms && currentPtt().id == id)
+            {
+                updateTxMeters(meterStart, budget);
+            }
         }
         return true;
     }
@@ -414,6 +457,7 @@ void MainControl::updateRadio()
         }
         if (m_externalTx)
         {
+            updateTxMeters(Clock::now());
             return;
         }
         if (micGainDue)
@@ -426,6 +470,12 @@ void MainControl::updateRadio()
         }
         if (!m_requested && now < m_nextRead)
         {
+            if (!settingWritePending && now >= m_nextRxMeter)
+            {
+                const auto level = m_radio->readMainSMeter();
+                m_nextRxMeter = m_clock.elapsed() + 150;
+                emit rxMeterChanged(m_session, level.value_or(-1));
+            }
             return;
         }
 
