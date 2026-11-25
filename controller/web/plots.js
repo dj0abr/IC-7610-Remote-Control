@@ -140,6 +140,29 @@ export class PlotPair {
     this.schedule();
   }
 
+  setPassband(low, high) {
+    if (this.passbandLow === low && this.passbandHigh === high) {
+      return;
+    }
+    this.passbandLow = low;
+    this.passbandHigh = high;
+    this.overlayDirty = true;
+    this.schedule();
+  }
+
+  passband(ctx, area) {
+    if (!this.zoom || !this.bounds || !this.passbandHigh) {
+      return;
+    }
+    const left = this.xAt(this.main + this.passbandLow, area);
+    const right = this.xAt(this.main + this.passbandHigh, area);
+    ctx.fillStyle = '#55d9ee15';
+    ctx.fillRect(left, area.top, right - left, area.height);
+    ctx.strokeStyle = '#55d9ee60';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(left, area.top, right - left, area.height);
+  }
+
   setStyle(lower, upper, color) {
     if (lower === this.lower && upper === this.upper && color === this.color) {
       return;
@@ -316,6 +339,7 @@ export class PlotPair {
     ctx.fillStyle = plotBackground;
     ctx.fillRect(area.left, area.top, area.width, area.height);
     this.reserve(ctx, area);
+    this.passband(ctx, area);
     this.grid(ctx, area);
 
     if (this.line && this.bounds) {
@@ -400,6 +424,7 @@ export class PlotPair {
     if (this.overlayDirty) {
       const overlay = prepare(this.overlay, true);
       this.reserve(overlay, area);
+      this.passband(overlay, area);
       this.marker(overlay, area);
       this.frame(overlay, area);
       this.drawFrequencyAxis(overlay, area);

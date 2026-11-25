@@ -221,15 +221,20 @@ public:
         socket.send(p);
     }
 
-    void sendTracked(Packet p)
+    void sendTracked(Packet p, bool replay = true)
     {
         writeLe(p, 0x06, 2, sequence_);
         constexpr std::uint16_t retainedPackets = 256;
         sent_.erase(static_cast<std::uint16_t>(sequence_ - retainedPackets));
-        sent_[sequence_] = p;
+        sent_[sequence_] = replay ? p : packet(headerSize, 0, sequence_);
         ++sequence_;
         send(p);
         nextIdle_ = Clock::now() + 100ms;
+    }
+
+    void forgetPackets()
+    {
+        sent_.clear();
     }
 
     Packet receive()
@@ -432,7 +437,7 @@ class Radio
 {
 public:
     Radio(bool verbose, std::string_view address)
-        : control_("Control", verbose), civ_("CI-V", verbose)
+        : control_("Control", verbose), civ_("CI-V", verbose), audio_("Audio", verbose)
     {
         destination_.sin_family = AF_INET;
         if (inet_pton(AF_INET, std::string(address).c_str(), &destination_.sin_addr) != 1)
@@ -444,6 +449,7 @@ public:
     ~Radio()
     {
         // Best-effort cleanup also applies if a read or stream setup fails.
+        releasePtt();
         try
         {
             if (civOpen_)
@@ -453,6 +459,16 @@ public:
             if (civ_.remoteId)
             {
                 civ_.send(civ_.packet(headerSize, 0x05));
+            }
+        }
+        catch (const std::exception&)
+        {
+        }
+        try
+        {
+            if (audio_.remoteId)
+            {
+                audio_.send(audio_.packet(headerSize, 0x05));
             }
         }
         catch (const std::exception&)
@@ -502,7 +518,7 @@ public:
         tokenRenewal_ = Clock::now() + 50s;
     }
 
-    void openSerial(const std::array<Byte, 16>& user)
+    void openSerial(const std::array<Byte, 16>& user, bool withAudio)
     {
         Packet capabilities;
         Packet connection;
@@ -523,9 +539,7 @@ public:
 
         const auto local = control_.socket.localAddress();
         civ_.socket.bindEphemeral(local);
-        // ConnInfo has an audio port field even when both audio directions are disabled.
-        UdpSocket audioPortReservation;
-        audioPortReservation.bindEphemeral(local);
+        audio_.socket.bindEphemeral(local);
 
         auto request = authPacket(0x90, 0x03);
         if (readLe(capabilities, 0x49, 2) == 0x8010)
@@ -540,11 +554,32 @@ public:
         std::copy_n(capabilities.begin() + 0x52, 32, request.begin() + 0x40);
         std::copy(user.begin(), user.end(), request.begin() + 0x60);
         writeBe(request, 0x7c, 4, ntohs(civ_.socket.localAddress().sin_port));
-        writeBe(request, 0x80, 4, ntohs(audioPortReservation.localAddress().sin_port));
+        writeBe(request, 0x80, 4, ntohs(audio_.socket.localAddress().sin_port));
         request[0x88] = 1;
-        control_.sendTracked(std::move(request));
-
-        const auto status = waitFor(control_, PacketShape{0x50, 0});
+        const auto openStreams = [&](bool audio) {
+            auto message = request;
+            if (audio)
+            {
+                message[0x70] = message[0x71] = 1;
+                message[0x72] = message[0x73] = 0x04; // Mono LPCM16.
+                writeBe(message, 0x74, 4, txAudioRate);
+                writeBe(message, 0x78, 4, txAudioRate);
+                writeBe(message, 0x84, 4, 80); // TX buffer in milliseconds.
+            }
+            control_.sendTracked(std::move(message));
+            return waitFor(control_, PacketShape{0x50, 0});
+        };
+        const auto valid = [](const Packet& status) {
+            return !status.empty() && readLe(status, 0x30, 4) == 0 &&
+                   status[0x40] == 0 && readPort(status, 0x42) != 0;
+        };
+        auto status = openStreams(withAudio);
+        if (withAudio && !valid(status))
+        {
+            withAudio = false;
+            writeBe(request, 0x16, 2, authSequence_++);
+            status = openStreams(false);
+        }
         if (status.empty())
         {
             throw std::runtime_error("Keine Antwort auf die Anforderung des CI-V-Kanals.");
@@ -558,6 +593,19 @@ public:
         handshake(civ_, "Keine Antwort auf dem ausgehandelten CI-V-Port.");
         openCiv(true);
         civOpen_ = true;
+        const auto audioPort = readPort(status, 0x46);
+        if (withAudio && audioPort)
+        {
+            try
+            {
+                audio_.connectTo(destination_, audioPort);
+                handshake(audio_, "Keine Antwort auf dem ausgehandelten Audio-Port.");
+            }
+            catch (const std::exception&)
+            {
+                audio_.connected = audio_.ready = false;
+            }
+        }
     }
 
     std::uint64_t frequency()
@@ -587,9 +635,135 @@ public:
         return mainFrequency();
     }
 
+    int rfPower()
+    {
+        const auto bytes = exchangeCiv(std::array<Byte, 2>{0x14, 0x0a}, false, 1, 120ms);
+        if (bytes.size() == 2)
+        {
+            const int tens = bytes[1] >> 4;
+            const int units = bytes[1] & 0x0f;
+            const int level = bytes[0] * 100 + tens * 10 + units;
+            if (tens <= 9 && units <= 9 && level <= maxRfPowerLevel)
+            {
+                return level;
+            }
+        }
+        throw std::runtime_error("Ungültiger RF-POWER-Wert vom IC-7610.");
+    }
+
+    void setRfPower(int level)
+    {
+        if (level < 0 || level > maxRfPowerLevel)
+        {
+            throw std::out_of_range("RF POWER außerhalb des Einstellbereichs.");
+        }
+        const auto high = static_cast<Byte>(level / 100);
+        const auto low = static_cast<Byte>(((level / 10 % 10) << 4) | (level % 10));
+        exchangeCiv(std::array<Byte, 4>{0x14, 0x0a, high, low}, true, 1, 160ms, false);
+    }
+
+    void setMicGain50Percent()
+    {
+        // 50% is 128, encoded as two BCD bytes.
+        exchangeCiv(std::array<Byte, 4>{0x14, 0x0b, 0x01, 0x28}, true, 1, 160ms, false);
+    }
+
+    int compressor()
+    {
+        return readSwitch(std::array<Byte, 2>{0x16, 0x44}, 1);
+    }
+
+    void setCompressor(int enabled)
+    {
+        exchangeCiv(std::array<Byte, 3>{0x16, 0x44, static_cast<Byte>(enabled)}, true, 1, 160ms, false);
+    }
+
+    int subPreamp()
+    {
+        return readSwitch(std::array<Byte, 4>{0x29, 0x01, 0x16, 0x02}, 2);
+    }
+
+    void setSubPreamp(int level)
+    {
+        exchangeCiv(std::array<Byte, 5>{0x29, 0x01, 0x16, 0x02, static_cast<Byte>(level)}, true, 1, 160ms, false);
+    }
+
     void service()
     {
         waitFor(control_, IgnorePacket{}, 2ms);
+    }
+
+    bool txAudioReady() const
+    {
+        return audio_.ready;
+    }
+
+    bool transmitting()
+    {
+        const auto bytes = exchangeCiv(std::array<Byte, 2>{0x1c, 0}, false, 1, 120ms);
+        if (bytes.size() != 1 || bytes[0] > 1)
+        {
+            throw std::runtime_error("Ungültiger TX-Status vom IC-7610.");
+        }
+        return bytes[0] == 1;
+    }
+
+    bool voiceTxMode()
+    {
+        const auto split = exchangeCiv(std::array<Byte, 1>{0x0f}, false, 1, 120ms);
+        const auto mode = exchangeCiv(std::array<Byte, 1>{0x04}, false, 1, 120ms);
+        const auto data = exchangeCiv(std::array<Byte, 2>{0x1a, 0x06}, false, 1, 120ms);
+        return split.size() == 1 && split[0] == 0 && !mode.empty() && mode[0] <= 1 &&
+               !data.empty() && data[0] == 0;
+    }
+
+    void setPtt(bool pressed)
+    {
+        if (pressed)
+        {
+            mayBeKeyed_ = true;
+        }
+        else
+        {
+            audio_.forgetPackets();
+        }
+        exchangeCiv(std::array<Byte, 3>{0x1c, 0, static_cast<Byte>(pressed)}, true, 1, 160ms, false);
+        if (!pressed)
+        {
+            // Confirmation by a separate read is still required for the GUI.
+            mayBeKeyed_ = false;
+        }
+    }
+
+    void releasePtt() noexcept
+    {
+        if (mayBeKeyed_)
+        {
+            // A dead audio socket must never prevent the CI-V release.
+            audio_.connected = audio_.ready = false;
+            try
+            {
+                setPtt(false);
+            }
+            catch (const std::exception&)
+            {
+            }
+        }
+    }
+
+    void sendTxAudio(std::span<const char> pcm)
+    {
+        if (!audio_.ready || !mayBeKeyed_ || pcm.size() != txAudioBytes)
+        {
+            throw std::runtime_error("TX-Audio ist nicht bereit.");
+        }
+        constexpr std::size_t audioHeader = 0x18;
+        auto packet = audio_.packet(audioHeader + pcm.size());
+        writeLe(packet, 0x10, 2, 0x0080);
+        writeBe(packet, 0x12, 2, audioSequence_++);
+        writeBe(packet, 0x16, 2, pcm.size());
+        std::copy(pcm.begin(), pcm.end(), packet.begin() + audioHeader);
+        audio_.sendTracked(std::move(packet));
     }
 
     std::string mode()
@@ -633,15 +807,19 @@ private:
         {
             control_.keepAlive(now);
             civ_.keepAlive(now);
+            audio_.keepAlive(now);
             if (authenticated_ && now >= tokenRenewal_)
             {
                 sendToken(0x05);
                 tokenRenewal_ = now + 50s;
             }
-            std::array<pollfd, 2> fds{{
-                {control_.socket.fd(), POLLIN, 0},
-                {civ_.connected ? civ_.socket.fd() : -1, POLLIN, 0},
-            }};
+            const std::array channels{&control_, &civ_, &audio_};
+            std::array<pollfd, channels.size()> fds{};
+            for (std::size_t i = 0; i < channels.size(); ++i)
+            {
+                const auto& channel = *channels[i];
+                fds[i] = {channel.connected ? channel.socket.fd() : -1, POLLIN, 0};
+            }
             const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
             const auto timeout = static_cast<int>(std::min(remaining, 50ms).count());
             if (::poll(fds.data(), fds.size(), timeout) < 0)
@@ -656,7 +834,7 @@ private:
             {
                 if (fds[i].revents & (POLLIN | POLLERR))
                 {
-                    auto& channel = i == 0 ? control_ : civ_;
+                    auto& channel = *channels[i];
                     auto packet = channel.receive();
                     if (&channel == &target && !packet.empty() && matches(packet))
                     {
@@ -730,16 +908,27 @@ private:
         civ_.sendTracked(std::move(p));
     }
 
+    int readSwitch(std::span<const Byte> command, Byte maximum)
+    {
+        const auto reply = exchangeCiv(command, false, 1, 120ms);
+        if (reply.size() != 1 || reply[0] > maximum)
+        {
+            throw std::runtime_error("Ungültiger Schaltwert vom IC-7610.");
+        }
+        return reply[0];
+    }
+
     Packet query(std::initializer_list<Byte> command)
     {
         return exchangeCiv(command, false);
     }
 
-    Packet exchangeCiv(std::span<const Byte> command, bool writing)
+    Packet exchangeCiv(std::span<const Byte> command, bool writing, int attempts = 3,
+                       std::chrono::milliseconds timeout = 900ms, bool replay = true)
     {
         const std::array<Byte, 4> requestStart{0xfe, 0xfe, radioCivAddress_, controllerCivAddress};
         const std::array<Byte, 4> replyStart{0xfe, 0xfe, controllerCivAddress, radioCivAddress_};
-        for (int attempt = 0; attempt < 3; ++attempt)
+        for (int attempt = 0; attempt < attempts; ++attempt)
         {
             const auto length = requestStart.size() + command.size() + 1;
             auto packet = civ_.packet(civHeaderSize + length);
@@ -750,9 +939,9 @@ private:
             std::copy(command.begin(), command.end(),
                       packet.begin() + civHeaderSize + requestStart.size());
             packet.back() = 0xfd;
-            civ_.sendTracked(std::move(packet));
+            civ_.sendTracked(std::move(packet), replay);
 
-            const auto reply = waitFor(civ_, CivReply{command, replyStart, writing}, 900ms);
+            const auto reply = waitFor(civ_, CivReply{command, replyStart, writing}, timeout);
             if (!reply.empty())
             {
                 if (writing)
@@ -770,14 +959,17 @@ private:
     sockaddr_in destination_{};
     Channel control_;
     Channel civ_;
+    Channel audio_;
     Clock::time_point tokenRenewal_{};
     bool authenticated_ = false;
     bool civOpen_ = false;
+    bool mayBeKeyed_ = false;
     Byte radioCivAddress_ = 0;
     std::uint32_t token_ = 0;
     std::uint16_t tokenRequest_ = 0;
     std::uint16_t authSequence_ = 0;
     std::uint16_t civSequence_ = 0;
+    std::uint16_t audioSequence_ = 0;
 };
 
 } // namespace
@@ -800,7 +992,7 @@ LanRadio::LanRadio(bool verbose, std::string_view address)
 
 LanRadio::~LanRadio() = default;
 
-void LanRadio::connectDefault(std::uint16_t port)
+void LanRadio::connectDefault(std::uint16_t port, bool withAudio)
 {
     const char* user = std::getenv("KMCONTROL_ICOM_USER");
     const char* password = std::getenv("KMCONTROL_ICOM_PASSWORD");
@@ -808,14 +1000,14 @@ void LanRadio::connectDefault(std::uint16_t port)
     {
         throw std::runtime_error("KMCONTROL_ICOM_USER und KMCONTROL_ICOM_PASSWORD für die IC-7610-Anmeldung setzen.");
     }
-    connect(user, password, port);
+    connect(user, password, port, withAudio);
 }
 
-void LanRadio::connect(std::string_view user, std::string_view password, std::uint16_t port)
+void LanRadio::connect(std::string_view user, std::string_view password, std::uint16_t port, bool withAudio)
 {
     const auto encodedUser = passcode(user);
     m_impl->radio.login(encodedUser, passcode(password), port);
-    m_impl->radio.openSerial(encodedUser);
+    m_impl->radio.openSerial(encodedUser, withAudio);
 }
 
 std::uint64_t LanRadio::frequency()
@@ -838,8 +1030,31 @@ std::uint64_t LanRadio::setMainFrequency(std::uint64_t hz)
     return m_impl->radio.setMainFrequency(hz);
 }
 
+int LanRadio::rfPower()
+{
+    return m_impl->radio.rfPower();
+}
+
+void LanRadio::setRfPower(int level)
+{
+    m_impl->radio.setRfPower(level);
+}
+
+void LanRadio::setMicGain50Percent() { m_impl->radio.setMicGain50Percent(); }
+int LanRadio::compressor() { return m_impl->radio.compressor(); }
+void LanRadio::setCompressor(int enabled) { m_impl->radio.setCompressor(enabled); }
+int LanRadio::subPreamp() { return m_impl->radio.subPreamp(); }
+void LanRadio::setSubPreamp(int level) { m_impl->radio.setSubPreamp(level); }
+
 void LanRadio::service()
 {
     m_impl->radio.service();
 }
+
+bool LanRadio::txAudioReady() const { return m_impl->radio.txAudioReady(); }
+bool LanRadio::transmitting() { return m_impl->radio.transmitting(); }
+bool LanRadio::voiceTxMode() { return m_impl->radio.voiceTxMode(); }
+void LanRadio::setPtt(bool pressed) { m_impl->radio.setPtt(pressed); }
+void LanRadio::releasePtt() noexcept { m_impl->radio.releasePtt(); }
+void LanRadio::sendTxAudio(std::span<const char> pcm) { m_impl->radio.sendTxAudio(pcm); }
 }

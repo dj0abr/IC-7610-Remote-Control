@@ -1,12 +1,36 @@
 #include "main-control.hpp"
 
+#include <algorithm>
 #include <exception>
+#include <utility>
+
+using namespace std::chrono_literals;
+
+namespace
+{
+constexpr auto latchTimeout = 5min;
+
+struct RadioSettingCommands
+{
+    const char* label;
+    int maximum;
+    int (icom::LanRadio::*read)();
+    void (icom::LanRadio::*write)(int);
+};
+
+constexpr std::array<RadioSettingCommands, MainControl::RadioSettingCount> radioSettings{{
+    {"Sendeleistung", icom::maxRfPowerLevel, &icom::LanRadio::rfPower, &icom::LanRadio::setRfPower},
+    {"TX-Kompressor", 1, &icom::LanRadio::compressor, &icom::LanRadio::setCompressor},
+    {"RX-Vorverstärker", 2, &icom::LanRadio::subPreamp, &icom::LanRadio::setSubPreamp},
+}};
+}
 
 MainControl::MainControl(QObject* parent)
     : QObject(parent),
       m_timer(new QTimer(this))
 {
-    m_timer->setInterval(80);
+    m_timer->setTimerType(Qt::PreciseTimer);
+    m_timer->setInterval(10);
     connect(m_timer, &QTimer::timeout, this, &MainControl::updateRadio);
 }
 
@@ -18,17 +42,220 @@ void MainControl::start(const QString& address, quint64 session)
     m_completedRevision = 0;
     m_clock.start();
     m_nextRead = 0;
+    m_nextPttRead = 0;
     m_retryAfter = 0;
     m_timer->start();
     emit statusChanged(m_session, 0, QStringLiteral("MAIN: LAN-CI-V verbinden …"));
+    reportTx(QStringLiteral("offline"), false, QStringLiteral("LAN verbinden …"));
 }
 
 void MainControl::stop()
 {
     m_timer->stop();
+    if (m_radio)
+    {
+        m_radio->releasePtt();
+    }
     m_radio.reset();
     m_requested.reset();
+    m_radioSettings = {};
+    m_micGainDue.reset();
     m_lastFrequency = 0;
+    m_ownedTx = 0;
+    m_externalTx = false;
+    m_txPhase.clear();
+}
+
+void MainControl::pttInput(quint64 session, quint32 id, const QString& action, bool latched)
+{
+    const std::lock_guard lock(m_txMutex);
+    if (action == QStringLiteral("start"))
+    {
+        m_input = {session, {id, latched}, Clock::now() + 750ms, {}, {}};
+    }
+    else if (session == m_input.session && id == m_input.ptt.id)
+    {
+        if (action == QStringLiteral("stop"))
+        {
+            m_input = {};
+        }
+        else if (Clock::now() < m_input.lease)
+        {
+            m_input.lease = Clock::now() + 750ms;
+        }
+    }
+}
+
+void MainControl::txAudioInput(quint64 session, quint32 id, QByteArray pcm)
+{
+    const std::lock_guard lock(m_txMutex);
+    const auto now = Clock::now();
+    if (session != m_input.session || id != m_input.ptt.id || now >= m_input.lease)
+    {
+        return;
+    }
+    m_input.lastAudio = now;
+    if (m_input.frames.size() == 4)
+    {
+        m_input.frames.pop_front();
+    }
+    m_input.frames.push_back(std::move(pcm));
+}
+
+void MainControl::cancelPtt()
+{
+    const std::lock_guard lock(m_txMutex);
+    m_input = {};
+}
+
+void MainControl::cancelPtt(quint32 id)
+{
+    const std::lock_guard lock(m_txMutex);
+    if (m_input.session == m_session && m_input.ptt.id == id)
+    {
+        m_input = {};
+    }
+}
+
+MainControl::PttRequest MainControl::currentPtt()
+{
+    const std::lock_guard lock(m_txMutex);
+    const auto now = Clock::now();
+    if (m_input.session != m_session || now >= m_input.lease || now - m_input.lastAudio > 320ms)
+    {
+        return {};
+    }
+    return m_input.ptt;
+}
+
+void MainControl::reportTx(const QString& phase, bool ready, const QString& text)
+{
+    if (phase != m_txPhase || ready != m_txReady || text != m_txText)
+    {
+        for (auto& setting : m_radioSettings)
+        {
+            if (phase != QStringLiteral("rx"))
+            {
+                setting.requested.reset();
+            }
+            else if (phase != m_txPhase)
+            {
+                setting.nextRead = 0;
+            }
+        }
+        m_txPhase = phase;
+        m_txReady = ready;
+        m_txText = text;
+        emit txChanged(m_session, phase, ready, text);
+    }
+}
+
+void MainControl::finishTx(const QString& text)
+{
+    cancelPtt(m_ownedTx);
+    reportTx(QStringLiteral("ending"), false);
+    m_radio->setPtt(false);
+    if (m_radio->transmitting())
+    {
+        m_radio->setPtt(false);
+        if (m_radio->transmitting())
+        {
+            throw std::runtime_error("RX wurde vom IC-7610 nicht bestätigt.");
+        }
+    }
+    m_ownedTx = 0;
+    m_externalTx = false;
+    reportTx(QStringLiteral("rx"), m_radio->txAudioReady(), text);
+}
+
+bool MainControl::processTx(Clock::time_point now, bool settingWritePending)
+{
+    const auto request = currentPtt();
+    const auto id = request.id;
+    if (m_ownedTx)
+    {
+        if (now >= m_txDeadline)
+        {
+            finishTx(QStringLiteral("Rast-PTT nach fünf Minuten beendet."));
+            return true;
+        }
+        if (id != m_ownedTx)
+        {
+            finishTx();
+            return true;
+        }
+        if (now >= m_nextAudio)
+        {
+            QByteArray pcm(icom::txAudioBytes, '\0');
+            {
+                const std::lock_guard lock(m_txMutex);
+                if (m_input.session == m_session && m_input.ptt.id == id && !m_input.frames.empty())
+                {
+                    pcm = std::move(m_input.frames.front());
+                    m_input.frames.pop_front();
+                }
+            }
+            if (currentPtt().id == id)
+            {
+                m_radio->sendTxAudio({pcm.constData(), static_cast<std::size_t>(pcm.size())});
+            }
+            m_nextAudio += 20ms;
+            if (m_nextAudio <= now)
+            {
+                m_nextAudio = now + 20ms;
+            }
+        }
+        if (now >= m_nextTxStatus)
+        {
+            if (!m_radio->transmitting())
+            {
+                finishTx(QStringLiteral("Der IC-7610 hat TX beendet."));
+            }
+            m_nextTxStatus = now + 1s;
+        }
+        return true;
+    }
+    if (!id || m_requested || settingWritePending || !m_radio->txAudioReady())
+    {
+        return false;
+    }
+    if (m_radio->transmitting())
+    {
+        cancelPtt(id);
+        m_externalTx = true;
+        reportTx(QStringLiteral("tx"), false, QStringLiteral("TX am Funkgerät"));
+        return true;
+    }
+    if (!m_radio->voiceTxMode())
+    {
+        cancelPtt(id);
+        reportTx(QStringLiteral("rx"), true, QStringLiteral("Für den Test SSB ohne DATA und ohne Split wählen."));
+        return true;
+    }
+    if (currentPtt().id != id)
+    {
+        return true;
+    }
+
+    m_ownedTx = id;
+    m_txDeadline = request.latched ? Clock::now() + latchTimeout : Clock::time_point::max();
+    reportTx(QStringLiteral("starting"), true);
+    m_radio->setPtt(true);
+    if (currentPtt().id != id)
+    {
+        finishTx();
+    }
+    else if (m_radio->transmitting())
+    {
+        m_nextAudio = Clock::now();
+        m_nextTxStatus = m_nextAudio + 1s;
+        reportTx(QStringLiteral("tx"), true);
+    }
+    else
+    {
+        finishTx();
+    }
+    return true;
 }
 
 void MainControl::tune(qint64 hz, quint64 revision)
@@ -36,6 +263,97 @@ void MainControl::tune(qint64 hz, quint64 revision)
     if (m_timer->isActive())
     {
         m_requested = TuneRequest{hz, revision};
+    }
+}
+
+void MainControl::setRadioSetting(quint64 session, int index, int value)
+{
+    if (session == m_session && m_radio && m_txPhase == QStringLiteral("rx") &&
+        index >= 0 && index < RadioSettingCount && value >= 0 && value <= radioSettings[index].maximum)
+    {
+        auto& setting = m_radioSettings[index];
+        if (setting.value >= 0)
+        {
+            setting.requested = value;
+        }
+    }
+}
+
+void MainControl::bandChanged(quint64 session)
+{
+    if (session == m_session && m_timer->isActive())
+    {
+        m_micGainDue = 0;
+        for (auto& setting : m_radioSettings)
+        {
+            setting.nextRead = 0;
+        }
+    }
+}
+
+void MainControl::applyMicGain()
+{
+    m_micGainDue.reset();
+    try
+    {
+        m_radio->setMicGain50Percent();
+    }
+    catch (const icom::CivRejected& error)
+    {
+        qWarning("MIC GAIN 50%%: %s", error.what());
+    }
+    catch (const std::exception& error)
+    {
+        qWarning("MIC GAIN 50%%: %s", error.what());
+        m_micGainDue = m_clock.elapsed() + 1500;
+    }
+}
+
+void MainControl::updateRadioSettings(qint64 now)
+{
+    // Prioritize writes and perform at most one setting per tick, so TX handling stays responsive.
+    auto next = std::ranges::find_if(m_radioSettings, [](const auto& setting) { return setting.requested.has_value(); });
+    if (next == m_radioSettings.end())
+    {
+        next = std::ranges::min_element(m_radioSettings, {}, &SettingState::nextRead);
+        if (now < next->nextRead)
+        {
+            return;
+        }
+    }
+
+    const auto index = static_cast<int>(next - m_radioSettings.begin());
+    const auto& command = radioSettings[index];
+    const QString label = QString::fromUtf8(command.label);
+    const auto requested = std::exchange(next->requested, std::nullopt);
+    QString text;
+    if (requested)
+    {
+        try
+        {
+            ((*m_radio).*command.write)(*requested);
+        }
+        catch (const std::exception&)
+        {
+            text = QStringLiteral("IC-7610 hat die Änderung nicht bestätigt (%1).").arg(label);
+        }
+    }
+
+    int value = -1;
+    try
+    {
+        value = ((*m_radio).*command.read)();
+    }
+    catch (const std::exception&)
+    {
+        text = QStringLiteral("%1 konnte nicht vom IC-7610 gelesen werden.").arg(label);
+    }
+    next->nextRead = m_clock.elapsed() + (value >= 0 ? 500 : 1500);
+    if (value != next->value || requested || (value < 0 && text != next->text))
+    {
+        next->value = value;
+        next->text = text;
+        emit radioSettingChanged(m_session, index, value, text);
     }
 }
 
@@ -66,11 +384,46 @@ void MainControl::updateRadio()
         if (newSession)
         {
             auto radio = std::make_unique<icom::LanRadio>(false, m_address.toStdString());
-            radio->connectDefault();
+            radio->connectDefault(icom::defaultControlPort, true);
             m_radio = std::move(radio);
+            m_micGainDue = 0;
         }
 
         m_radio->service();
+        const bool micGainDue = m_micGainDue && now >= *m_micGainDue;
+        const bool settingWritePending = micGainDue ||
+            std::ranges::any_of(m_radioSettings, [](const auto& setting) { return setting.requested.has_value(); });
+        if (processTx(Clock::now(), settingWritePending))
+        {
+            return;
+        }
+        if (now >= m_nextPttRead || settingWritePending)
+        {
+            m_externalTx = m_radio->transmitting();
+            m_nextPttRead = m_clock.elapsed() + 120;
+            if (m_externalTx)
+            {
+                reportTx(QStringLiteral("tx"), false, QStringLiteral("TX am Funkgerät"));
+            }
+            else if (m_txPhase != QStringLiteral("rx"))
+            {
+                const bool ready = m_radio->txAudioReady();
+                reportTx(QStringLiteral("rx"), ready,
+                         ready ? QString() : QStringLiteral("LAN-TX-Audiokanal nicht verfügbar."));
+            }
+        }
+        if (m_externalTx)
+        {
+            return;
+        }
+        if (micGainDue)
+        {
+            applyMicGain();
+        }
+        else
+        {
+            updateRadioSettings(now);
+        }
         if (!m_requested && now < m_nextRead)
         {
             return;
@@ -116,11 +469,38 @@ void MainControl::updateRadio()
     }
     catch (const std::exception& error)
     {
+        const bool uncertainTx = m_ownedTx || m_externalTx || m_txPhase == QStringLiteral("unknown");
+        if (m_ownedTx)
+        {
+            cancelPtt(m_ownedTx);
+        }
+        else if (const auto id = currentPtt().id)
+        {
+            cancelPtt(id);
+        }
+        if (m_radio)
+        {
+            m_radio->releasePtt();
+        }
+        m_ownedTx = 0;
         m_radio.reset();
+        for (int index = 0; index < RadioSettingCount; ++index)
+        {
+            auto& setting = m_radioSettings[index];
+            if (setting.value >= 0 || !setting.text.isEmpty())
+            {
+                emit radioSettingChanged(m_session, index, -1, {});
+            }
+            setting = {};
+        }
+        m_micGainDue.reset();
         m_lastFrequency = 0;
         m_nextRead = 0;
+        m_nextPttRead = 0;
         m_retryAfter = m_clock.elapsed() + 1500;
         const quint64 revision = m_requested ? m_requested->revision : m_completedRevision;
         emit statusChanged(m_session, revision, QStringLiteral("MAIN: ") + QString::fromUtf8(error.what()));
+        reportTx(uncertainTx ? QStringLiteral("unknown") : QStringLiteral("offline"), false,
+                 uncertainTx ? QStringLiteral("RX prüfen · LAN-Verbindung gestört") : QStringLiteral("LAN verbinden …"));
     }
 }

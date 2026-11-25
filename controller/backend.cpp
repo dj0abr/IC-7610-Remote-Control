@@ -16,6 +16,8 @@
 #include <QtEndian>
 #include <algorithm>
 #include <cmath>
+#include <csignal>
+#include <limits>
 #include <span>
 
 namespace
@@ -28,6 +30,12 @@ constexpr int spectrumFps = 20;
 constexpr int audioFrameSamples = SsbDemodulator::audioRate / 50;
 constexpr qint64 streamQueueLimit = 128 * 1024;
 constexpr qint64 mainStepHz = 50;
+volatile std::sig_atomic_t stopRequested = 0;
+
+void requestStop(int)
+{
+    stopRequested = 1;
+}
 
 using Sideband = SsbDemodulator::Sideband;
 
@@ -93,6 +101,16 @@ public:
         m_volume = std::clamp(m_settings.value(QStringLiteral("audio/volume"), 35).toInt(), 0, 100);
         m_defaultSideband = parseSideband(m_settings.value(sidebandKey(nullptr)).toString());
         m_sideband = m_defaultSideband;
+        const RxFilterSettings storedFilter{
+            m_settings.value(QStringLiteral("audio/filter_low_hz"), RxFilterSettings::minimumHz).toDouble(),
+            m_settings.value(QStringLiteral("audio/filter_high_hz"), RxFilterSettings::maximumHz).toDouble(),
+        };
+        if (storedFilter.valid() && m_demodulator.setRxFilter(storedFilter))
+        {
+            m_rxFilter = storedFilter;
+        }
+        m_nrPercent = std::clamp(m_settings.value(QStringLiteral("audio/nr_percent"), 0).toInt(), 0, 100);
+        m_demodulator.setNoiseReduction(m_nrPercent);
         m_pi.setReadBufferSize(2 * 1024 * 1024);
         m_retry.setSingleShot(true);
         m_retry.setInterval(1000);
@@ -109,11 +127,14 @@ public:
         connect(&m_mainThread, &QThread::finished, m_mainControl, &QObject::deleteLater);
         connect(m_mainControl, &MainControl::frequencyChanged, this, &Backend::updateMainFrequency);
         connect(m_mainControl, &MainControl::statusChanged, this, &Backend::updateMainStatus);
+        connect(m_mainControl, &MainControl::radioSettingChanged, this, &Backend::updateRadioSetting);
+        connect(m_mainControl, &MainControl::txChanged, this, &Backend::updateTx);
         m_mainThread.start();
     }
 
     ~Backend() override
     {
+        m_mainControl->cancelPtt();
         if (m_gui)
         {
             disconnect(m_gui, nullptr, this, nullptr);
@@ -200,6 +221,7 @@ private:
                   {QStringLiteral("bands"), catalog}});
             state(QStringLiteral("idle"), QStringLiteral("Band auswählen"));
             sendSetup();
+            sendRxFilter();
             startMainControl();
         }
     }
@@ -210,6 +232,24 @@ private:
         {
             const auto request = QJsonDocument::fromJson(m_gui->readLine(4096)).object();
             const QString operation = request.value(QStringLiteral("op")).toString();
+            if (operation == QStringLiteral("ptt") || operation == QStringLiteral("tx_audio"))
+            {
+                handleTxInput(request, operation == QStringLiteral("ptt"));
+                continue;
+            }
+            if ((m_rxPaused || m_clientPttId) &&
+                (operation == QStringLiteral("band") || operation == QStringLiteral("set_main") ||
+                 operation == QStringLiteral("step_main") || operation == QStringLiteral("setup")))
+            {
+                if (operation == QStringLiteral("setup"))
+                {
+                    send({{QStringLiteral("type"), QStringLiteral("setup-result")},
+                          {QStringLiteral("request_id"), request.value(QStringLiteral("request_id"))},
+                          {QStringLiteral("ok"), false},
+                          {QStringLiteral("text"), QStringLiteral("Adresse kann während TX nicht geändert werden.")}});
+                }
+                continue;
+            }
             if (operation == QStringLiteral("set_main"))
             {
                 requestMain(request);
@@ -239,9 +279,20 @@ private:
                 }
                 continue;
             }
+            if (operation == QStringLiteral("rx_filter"))
+            {
+                setRxFilter(request);
+                continue;
+            }
             if (operation == QStringLiteral("volume"))
             {
                 setVolume(request.value(QStringLiteral("percent")).toInt(-1));
+                continue;
+            }
+            if (operation == QStringLiteral("rf_power") || operation == QStringLiteral("compressor") ||
+                operation == QStringLiteral("preamp"))
+            {
+                requestRadioSetting(operation, request);
                 continue;
             }
             if (operation == QStringLiteral("audio_output"))
@@ -263,6 +314,10 @@ private:
             {
                 state(QStringLiteral("error"), QStringLiteral("Unbekannter Bandbefehl"));
                 continue;
+            }
+            if (m_desired && m_desired != band)
+            {
+                QMetaObject::invokeMethod(m_mainControl, "bandChanged", Qt::QueuedConnection, Q_ARG(quint64, m_mainSession));
             }
             m_desired = band;
             m_sideband = parseSideband(m_settings.value(sidebandKey(band)).toString(), m_defaultSideband);
@@ -369,6 +424,47 @@ private:
         }
     }
 
+    void sendRxFilter(const QJsonValue& requestId = {}, const QString& text = {})
+    {
+        send({{QStringLiteral("type"), QStringLiteral("rx-filter")},
+              {QStringLiteral("low_hz"), m_rxFilter.lowHz},
+              {QStringLiteral("high_hz"), m_rxFilter.highHz},
+              {QStringLiteral("nr_percent"), m_nrPercent},
+              {QStringLiteral("request_id"), requestId},
+              {QStringLiteral("text"), text}});
+    }
+
+    void setRxFilter(const QJsonObject& request)
+    {
+        const RxFilterSettings settings{
+            request.value(QStringLiteral("low_hz")).toDouble(-1),
+            request.value(QStringLiteral("high_hz")).toDouble(-1),
+        };
+        const int percent = request.value(QStringLiteral("nr_percent")).toInt(-1);
+        const auto requestId = request.value(QStringLiteral("request_id"));
+        if (!settings.valid() || percent < 0 || percent > 100)
+        {
+            sendRxFilter(requestId, QStringLiteral("Filtergrenzen 100–4000 Hz, mindestens 500 Hz Abstand. NR 0–100 %."));
+            return;
+        }
+        if (!m_demodulator.setRxFilter(settings))
+        {
+            sendRxFilter(requestId, QStringLiteral("Der RX-Filter konnte nicht eingestellt werden."));
+            return;
+        }
+        if (settings != m_rxFilter || percent != m_nrPercent)
+        {
+            m_rxFilter = settings;
+            m_nrPercent = percent;
+            m_demodulator.setNoiseReduction(percent);
+            m_settings.setValue(QStringLiteral("audio/filter_low_hz"), settings.lowHz);
+            m_settings.setValue(QStringLiteral("audio/filter_high_hz"), settings.highHz);
+            m_settings.setValue(QStringLiteral("audio/nr_percent"), percent);
+            updateDemodulator(false);
+        }
+        sendRxFilter(requestId);
+    }
+
     void setVolume(int percent)
     {
         if (percent < 0 || percent > 100)
@@ -395,11 +491,160 @@ private:
 
     void startMainControl()
     {
+        m_mainControl->cancelPtt();
+        m_clientPttId = 0;
+        m_txReady = false;
         ++m_mainSession;
         m_mainRevision = 0;
+        for (int index = 0; index < MainControl::RadioSettingCount; ++index)
+        {
+            updateRadioSetting(m_mainSession, index, -1, {});
+        }
         QMetaObject::invokeMethod(m_mainControl, "start", Qt::QueuedConnection,
                                   Q_ARG(QString, m_radioAddress),
                                   Q_ARG(quint64, m_mainSession));
+    }
+
+    void handleTxInput(const QJsonObject& request, bool control)
+    {
+        const auto value = request.value(QStringLiteral("id")).toDouble(0);
+        if (!std::isfinite(value) || value < 1 || value > std::numeric_limits<quint32>::max() ||
+            std::floor(value) != value)
+        {
+            return;
+        }
+        const auto id = static_cast<quint32>(value);
+        if (control)
+        {
+            const auto action = request.value(QStringLiteral("action")).toString();
+            bool latched = false;
+            if (action == QStringLiteral("start"))
+            {
+                const auto mode = request.value(QStringLiteral("mode")).toString(QStringLiteral("hold"));
+                if (!m_txReady || m_rxPaused || m_clientPttId)
+                {
+                    return;
+                }
+                if (mode != QStringLiteral("hold") && mode != QStringLiteral("toggle"))
+                {
+                    return;
+                }
+                latched = mode == QStringLiteral("toggle");
+                m_clientPttId = id;
+            }
+            else if (id != m_clientPttId ||
+                     (action != QStringLiteral("stop") && action != QStringLiteral("keepalive")))
+            {
+                return;
+            }
+            else if (action == QStringLiteral("stop"))
+            {
+                m_clientPttId = 0;
+            }
+            m_mainControl->pttInput(m_mainSession, id, action, latched);
+        }
+        else if (id == m_clientPttId)
+        {
+            auto pcm = QByteArray::fromBase64(request.value(QStringLiteral("pcm")).toString().toLatin1(),
+                                              QByteArray::AbortOnBase64DecodingErrors);
+            if (pcm.size() == icom::txAudioBytes)
+            {
+                m_mainControl->txAudioInput(m_mainSession, id, std::move(pcm));
+            }
+        }
+    }
+
+    void requestRadioSetting(const QString& operation, const QJsonObject& request)
+    {
+        if (m_rxPaused || m_clientPttId)
+        {
+            return;
+        }
+
+        int index;
+        int value;
+        if (operation == QStringLiteral("rf_power"))
+        {
+            const int percent = request.value(QStringLiteral("percent")).toInt(-1);
+            if (percent < 0 || percent > 100)
+            {
+                return;
+            }
+            index = MainControl::RfPower;
+            value = (percent * icom::maxRfPowerLevel + 50) / 100;
+        }
+        else
+        {
+            index = operation == QStringLiteral("compressor") ? MainControl::Compressor : MainControl::Preamp;
+            value = request.value(QStringLiteral("value")).toInt(-1);
+        }
+        QMetaObject::invokeMethod(m_mainControl, "setRadioSetting", Qt::QueuedConnection,
+                                  Q_ARG(quint64, m_mainSession), Q_ARG(int, index), Q_ARG(int, value));
+    }
+
+    void updateRadioSetting(quint64 session, int index, int value, const QString& text)
+    {
+        if (session != m_mainSession)
+        {
+            return;
+        }
+
+        if (index == MainControl::RfPower)
+        {
+            const QJsonValue percent = value < 0 ? QJsonValue(QJsonValue::Null)
+                : QJsonValue((value * 100 + icom::maxRfPowerLevel / 2) / icom::maxRfPowerLevel);
+            send({{QStringLiteral("type"), QStringLiteral("rf-power")},
+                  {QStringLiteral("percent"), percent},
+                  {QStringLiteral("text"), text}});
+            return;
+        }
+        const QString type = index == MainControl::Compressor ? QStringLiteral("compressor") : QStringLiteral("preamp");
+        send({{QStringLiteral("type"), type},
+              {QStringLiteral("value"), value < 0 ? QJsonValue(QJsonValue::Null) : QJsonValue(value)},
+              {QStringLiteral("text"), text}});
+    }
+
+    void updateTx(quint64 session, const QString& phase, bool ready, const QString& text)
+    {
+        if (!m_gui || session != m_mainSession)
+        {
+            return;
+        }
+        m_txReady = ready && phase == QStringLiteral("rx");
+        if (phase == QStringLiteral("rx") || phase == QStringLiteral("offline") ||
+            phase == QStringLiteral("unknown") || !ready)
+        {
+            m_mainControl->cancelPtt();
+            m_clientPttId = 0;
+        }
+        const bool paused = phase != QStringLiteral("rx") && phase != QStringLiteral("offline");
+        const bool changed = paused != m_rxPaused;
+        m_rxPaused = paused;
+        send({{QStringLiteral("type"), QStringLiteral("tx")},
+              {QStringLiteral("phase"), phase},
+              {QStringLiteral("ready"), ready},
+              {QStringLiteral("text"), text}});
+        if (changed)
+        {
+            m_samples.clear();
+            updateDemodulator();
+            if (paused)
+            {
+                m_deadline.stop();
+            }
+            else if (m_pi.state() == QAbstractSocket::UnconnectedState)
+            {
+                connectPi();
+            }
+            else if (m_header && !m_pending && m_desired != m_active)
+            {
+                tune();
+            }
+            else
+            {
+                m_deadline.start();
+            }
+        }
     }
 
     void updateMainFrequency(quint64 session, quint64 revision, qint64 hz)
@@ -433,8 +678,8 @@ private:
     void updateDemodulator(bool reset = true)
     {
         const qint64 offset = m_mainHz - m_center;
-        const bool receiving = m_streamAudio && m_active && m_mainHz > 0 &&
-            std::abs(offset) + SsbDemodulator::audioHighHz <= Spectrum::usableHalfWidthHz;
+        const bool receiving = !m_rxPaused && m_streamAudio && m_active && m_mainHz > 0 &&
+            std::abs(offset) + m_rxFilter.highHz <= Spectrum::usableHalfWidthHz;
         if (reset || receiving != m_demodulating)
         {
             m_audioCount = 0;
@@ -505,6 +750,9 @@ private:
         m_gui = nullptr;
         m_mainHz = 0;
         m_streamAudio = false;
+        m_mainControl->cancelPtt();
+        m_clientPttId = 0;
+        m_rxPaused = m_txReady = false;
         QMetaObject::invokeMethod(m_mainControl, "stop", Qt::QueuedConnection);
         m_desired = nullptr;
         m_sideband = m_defaultSideband;
@@ -528,7 +776,7 @@ private:
 
     void connectPi()
     {
-        if (!m_gui || !m_desired || m_pi.state() != QAbstractSocket::UnconnectedState)
+        if (m_rxPaused || !m_gui || !m_desired || m_pi.state() != QAbstractSocket::UnconnectedState)
         {
             return;
         }
@@ -579,7 +827,7 @@ private:
 
     void tune()
     {
-        if (!m_desired)
+        if (m_rxPaused || !m_desired)
         {
             return;
         }
@@ -703,7 +951,7 @@ private:
             offset += 12 + payload;
         }
         m_data.remove(0, offset);
-        if (m_active && !m_pending)
+        if (!m_rxPaused && m_active && !m_pending)
         {
             m_deadline.start();
         }
@@ -747,8 +995,14 @@ private:
 
     void samples(const char* data, int length)
     {
-        if (!m_active || !m_gui)
+        if (m_rxPaused || !m_active || !m_gui)
         {
+            return;
+        }
+        // The IC-7610 supplies zeroed I/Q during TX, including before the CI-V status arrives.
+        if (std::all_of(data, data + length, [](char byte) { return byte == 0; }))
+        {
+            m_samples.clear();
             return;
         }
         if (m_demodulating)
@@ -784,6 +1038,8 @@ private:
     int m_audioCount = 0;
     Sideband m_defaultSideband = Sideband::Lsb;
     Sideband m_sideband = Sideband::Lsb;
+    RxFilterSettings m_rxFilter;
+    int m_nrPercent = 0;
     SsbDemodulator m_demodulator;
     QThread m_mainThread;
     MainControl* m_mainControl = new MainControl;
@@ -806,6 +1062,9 @@ private:
     quint64 m_mainRevision = 0;
     bool m_header = false;
     bool m_demodulating = false;
+    bool m_rxPaused = false;
+    bool m_txReady = false;
+    quint32 m_clientPttId = 0;
 };
 }
 
@@ -827,5 +1086,15 @@ int main(int argc, char** argv)
     {
         return 1;
     }
+    std::signal(SIGINT, requestStop);
+    std::signal(SIGTERM, requestStop);
+    QTimer signalTimer;
+    QObject::connect(&signalTimer, &QTimer::timeout, &app, [&app] {
+        if (stopRequested)
+        {
+            app.quit();
+        }
+    });
+    signalTimer.start(50);
     return app.exec();
 }

@@ -13,27 +13,20 @@ Das Funkgerät muss im LAN erreichbar und der integrierte Server unter **MENU �
 
 Bei einer erfolgreichen Abfrage druckt das Programm Frequenz in Hz und Betriebsart. Bei einem Verbindungs- oder Protokollfehler endet es mit Status 1.
 
-Protokollquellen sind die [Icom CI-V-Referenz](https://www.icomjapan.com/support/manual/1745/), die [wfview-Paketdefinitionen](https://github.com/wf-group/wfview/blob/fb79cd09ec334d06c923b8f087eed2dc77caf2ab/include/packettypes.h), die [CardSat-Protokollnotizen](https://github.com/prstoetzer/CardSat/blob/8933bcfe7a5c208d143c0b3bb945434dfd80023e/docs/interfaces/ICOM_LAN_PROTOCOL.md) und die [IC-7610-Mitschnitte von RigPlane](https://github.com/rigplane/rigplane-core/blob/fc301e1fd76debd638bdf8080670001212165437/tests/fixtures/ic7610/README.md).
+Der [Quellenindex](../doc/Quellen.md) verlinkt die CI-V-Referenz von Icom, die wfview-Paketdefinitionen, die CardSat-Protokollnotizen und die IC-7610-Mitschnitte von RigPlane.
 
 ## Backend und WebGUI
 
-Das Backend und die HTTP-/WebSocket-Bridge sind C++20-Programme. Der Build verwendet CMake, Boost, Qt 5.15, FFTW für einfache Genauigkeit (fftw3f) und LiquidDSP. CMake sucht LiquidDSP in den üblichen Systempfaden. Für eine separate Installation kann `-DLIQUID_ROOT=/pfad/zu/liquid-dsp` gesetzt werden.
+Das Backend und die HTTP-/WebSocket-Bridge sind C++20-Programme. Der Build verwendet CMake, Boost, Qt 5.15, FFTW für einfache Genauigkeit (fftw3f), LiquidDSP und SpeexDSP. CMake verwendet standardmäßig die vorhandene LiquidDSP-Installation des QO100-Transceivers und das SpeexDSP-Bundle aus QO100_TRX2. Andere Pfade lassen sich mit `-DLIQUID_ROOT=/pfad/zu/libs` und `-DSPEEXDSP_ROOT=/pfad/zum/bundle` setzen. Ohne passendes SpeexDSP-Bundle verwendet der Build das per pkg-config installierte SpeexDSP-Entwicklungspaket.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-Das Backend benötigt die Anmeldedaten des IC-7610. In Bash lässt sich das Kennwort verdeckt einlesen und nur an den Backend-Prozess weitergeben.
+Bei einer Einrichtung mit privatem Neustartskript startet `./restart-local.sh` die vorgebauten Programme im Projektordner neu. Das private Skript übergibt die Funkgeräte-Zugangsdaten an das Backend. Die Startprotokolle stehen unter `.kmcontrol-run/`.
 
-```bash
-read -r -p 'IC-7610 Benutzername: ' KMCONTROL_ICOM_USER
-read -r -s -p 'IC-7610 Kennwort: ' KMCONTROL_ICOM_PASSWORD
-printf '\n'
-KMCONTROL_ICOM_USER="$KMCONTROL_ICOM_USER" KMCONTROL_ICOM_PASSWORD="$KMCONTROL_ICOM_PASSWORD" ./build/kmcontrol-backend
-```
-
-In einem zweiten Terminal `./build/kmcontrol-web` starten und [kmcontrol im Browser öffnen](http://127.0.0.1:8086/). `kmcontrol-web --port PORT` wählt einen anderen lokalen HTTP-/WebSocket-Port. Die Bridge lauscht auf dem Rechner mit dem Backend unter `127.0.0.1`. Sie liefert die eingebetteten Browserdateien und verbindet `/ws` mit dem TCP-Backend auf `127.0.0.1:50020`. Die Browseroberfläche gibt Bedienbefehle als JSON weiter und zeichnet beide FFT-Ansichten mit Canvas.
+Für einen manuellen Start `KMCONTROL_ICOM_USER` und `KMCONTROL_ICOM_PASSWORD` in der Umgebung von `./build/kmcontrol-backend` setzen. In einem zweiten Terminal `./build/kmcontrol-web` starten und [kmcontrol im Browser öffnen](http://127.0.0.1:8086/). `kmcontrol-web --port PORT` wählt einen anderen lokalen HTTP-/WebSocket-Port. Die Bridge lauscht auf dem Rechner mit dem Backend unter `127.0.0.1`. Sie liefert die eingebetteten Browserdateien und verbindet `/ws` mit dem TCP-Backend auf `127.0.0.1:50020`. Die Browseroberfläche gibt Bedienbefehle als JSON weiter und zeichnet beide FFT-Ansichten mit Canvas.
 
 Der IC-7610 hat pro Backend einen Bedienplatz. Das Backend gibt den I/Q-Strom beim Schließen des aktiven Browser-Clients an den Pi zurück. Der Backend-Parameter `--pi HOST` übersteuert beim Start die gespeicherte Pi-Adresse. Die Vorgaben für IC-7610 und Pi sind 192.168.10.133 und 192.168.10.140.
 
@@ -47,13 +40,27 @@ Für beide Ansichten wertet das Backend dieselbe Hann-gefensterte FFT mit 131.07
 
 Im Menü **Wasserfall** setzen **Untere Schwelle** und **Obere Schwelle** den gemeinsamen dBFS-Anzeigebereich und färben vorhandene Zeilen entsprechend ein. Der Browser speichert beide Schwellen pro Band und stellt sie beim Bandwechsel wieder her. Für Bänder ohne eigene Werte gelten die früher global gespeicherten Schwellen oder standardmäßig −120 und −25 dBFS. Die **Diagrammfarbe** gilt für alle Bänder und für beide Spektren und Wasserfälle.
 
-**Audio einschalten** aktiviert den Empfangston im Browser. Unter **Setup → Wiedergabegerät** stehen der Systemstandard und die vom Browser freigegebenen lokalen Audioausgänge zur Auswahl. Die Auswahl schaltet auch bei laufendem Empfang sofort um und wird im Browser gespeichert.
+**Audio einschalten** unter dem Zoom-Wasserfall aktiviert den Empfangston und öffnet das gewählte Mikrofon. Wenn der Browser den Mikrofonzugriff blockiert, bleibt der Empfangston verfügbar. **Audio ausschalten** beendet beides. Nach einer Verbindungsunterbrechung lässt sich Audio mit demselben Button wieder einschalten. Unter **Setup → Wiedergabegerät** stehen der Systemstandard und die vom Browser freigegebenen lokalen Audioausgänge zur Auswahl. Die Auswahl schaltet auch bei laufendem Empfang sofort um und wird im Browser gespeichert.
+
+Unter **Setup → Eingabegerät** lässt sich das Mikrofon auswählen. Steht zunächst nur **Systemstandard** zur Auswahl, zeigt der Browser nach **Soundkarten freigeben …** oder **Mikrofone freigeben …** seine Geräte an. Die Auswahl wird im Browser gespeichert. Im Empfangsbetrieb wechselt ein bereits geöffnetes Mikrofon sofort auf das neu gewählte Gerät.
+
+Unter dem Zoom-Wasserfall stehen Empfangslautstärke, Sendeleistung, Audio und PTT. Der Regler **Sendeleistung** zeigt den RF-POWER-Sollwert des IC-7610 in Prozent. Im Empfang sendet die WebGUI Änderungen beim Loslassen des Reglers und zeigt den zurückgelesenen Wert. Änderungen direkt am Funkgerät übernimmt sie im Empfang etwa alle 500 ms. Während TX ist der Regler gesperrt und nach der Rückkehr zu RX wird der Wert neu gelesen. PTT ist verfügbar, sobald das Mikrofon geöffnet ist, der Icom RX meldet und der LAN-Audiokanal bereit ist. Unter **Setup → PTT-Modus** speichert der Browser die Wahl zwischen **Halten** und **Rasten**. Im Haltemodus endet TX beim Loslassen. Im Rastmodus endet TX bei der nächsten Betätigung oder nach fünf Minuten. Die **Leertaste** arbeitet außerhalb von Eingabefeldern im gewählten Modus.
+
+Unter **Empfang → RX-Vorverstärker (SUB)** stehen Aus, Stufe 1 und Stufe 2 zur Auswahl. Das betrifft den SUB-Empfänger, der die I/Q-Daten liefert. Unter **Setup → TX-Kompressor** lässt sich der Sprachkompressor ein- und ausschalten. Die WebGUI übernimmt im Empfang den jeweils vom IC-7610 bestätigten Zustand.
+
+Beim Aufbau der LAN-CI-V-Verbindung und bei jedem Bandwechsel setzt das Backend **MIC GAIN** auf 50 % (CI-V-Wert 128). Falls das Gerät sendet, wartet das Backend damit bis zur Rückkehr zu RX.
+
+Zum Senden muss der IC-7610 auf SSB ohne DATA und ohne Split stehen. Im Gerätemenü unter **Connectors → MOD Input** muss **DATA OFF MOD** auf **LAN** stehen. Der separate **LAN MOD Level** bestimmt den Sendepegel. Der Browser überträgt während Software-PTT Mono-PCM16 mit 16 kHz. Der IC-7610 bestätigt TX und RX über CI-V.
+
+Die Wasserfälle halten während TX an. Fokusverlust, fehlende Audiodaten und ein ausbleibendes PTT-Lebenszeichen lösen die Software-PTT in beiden Modi. Bei Rast-PTT erzwingt das Backend nach fünf Minuten die Rückkehr zu RX. Der **Time-Out Timer (CI-V)** am Icom begrenzt die Sendedauer auch bei einem Ausfall der LAN-Strecke zum Gerät.
 
 Wenn Chromium zunächst nur den Systemstandard anzeigt, öffnet **Soundkarten freigeben …** den Freigabedialog für die Geräteliste. Chromium verwendet hierfür die Mikrofonberechtigung. kmcontrol schließt den Mikrofonstream sofort und verarbeitet daraus keine Audiodaten. Browser mit einem eigenen Freigabedialog für Audioausgänge bieten **Wiedergabegerät freigeben …** an. Browser ohne direkte Geräteauswahl verwenden den Systemstandard.
 
 Die IPv4-Adressen des IC-7610 und des Raspberry Pi stehen ebenfalls direkt unter **Setup**. Enter oder das Verlassen des jeweiligen Felds übernimmt eine gültige Adresse und baut die entsprechende Verbindung neu auf. Das Backend speichert Adressen und Lautstärke benutzerspezifisch. Es speichert USB oder LSB pro Band und stellt die Auswahl beim Bandwechsel wieder her. Für Bänder ohne eigene Einstellung gilt die früher global gespeicherte Auswahl oder standardmäßig LSB.
 
-Das Backend mischt die Differenz zwischen der MAIN-Softwarefrequenz und der bestätigten SUB-Frequenz aus dem I/Q-Strom auf Basisband. LiquidDSP dezimiert auf 12 kSamples/s, filtert das gewählte Seitenband im Bereich von ungefähr 300 bis 2700 Hz und erzeugt daraus Mono-Audio mit 48 kSamples/s. Die automatische Verstärkungsregelung nutzt den mittleren Pegel hinter dem Seitenbandfilter und kann schwache Signale um bis zu 72 dB anheben. Ein separater Spitzenbegrenzer schützt die Audioausgabe vor Übersteuerung.
+Unter **Filter** stehen wie bei QO100 die Presets **3,9**, **2,7** und **2,4 kHz**, die beiden Filtergrenzen und **Rauschreduktion**. Die Grenzen liegen im Bereich 100–4000 Hz, lassen sich in 0,5-Hz-Schritten einstellen und bleiben mindestens 500 Hz auseinander. Ein Preset behält die untere Grenze, soweit seine Bandbreite Platz hat. Der Zoom markiert den Durchlass bei USB rechts und bei LSB links von MAIN. Das Backend speichert die Filtergrenzen und Rauschreduktion gemeinsam für alle Bänder. Die Vorgabe lautet 100–4000 Hz und 0 % Rauschreduktion.
+
+Das Backend mischt die Differenz zwischen der MAIN-Softwarefrequenz und der bestätigten SUB-Frequenz aus dem I/Q-Strom auf Basisband. LiquidDSP dezimiert auf 12 kSamples/s und filtert das gewählte Seitenband mit dem 513-Tap-Kaiser-FIR aus dem QO100-Konzept. Bei einer Änderung der Filtergrenzen überblendet das Backend zwischen den Filtern über 20 ms. Die automatische Verstärkungsregelung nutzt den mittleren Pegel hinter dem Seitenbandfilter und kann schwache Signale um bis zu 72 dB anheben. SpeexDSP verarbeitet das Audio bei 12 kHz mit bis zu 30 dB eingestellter Rauschdämpfung und überblendet beim Aktivieren oder Deaktivieren. Bei 0 % bleibt das trockene Audio erhalten. Anschließend wird Mono-Audio mit 48 kSamples/s und Spitzenbegrenzung an den Browser geliefert.
 
 Die Empfangsausschnitte folgen dem [IARU-Region-1-HF-Bandplan](https://www.iaru-r1.org/wp-content/uploads/2019/08/hf_r1_bandplan.pdf). 10 m verwendet die gewünschten Anzeigeabschnitte 28–29 und 29–30 MHz. Der CB-Ausschnitt umfasst [alle 80 deutschen CB-Kanäle](https://www.bundesnetzagentur.de/865198). Die Ränder sind mit 5 bis 25 kHz Reserve schattiert. Bei 160 bis 12 m liegt die Mitte 15 kHz unter dem unteren Anzeigerand. Bei 10 m und CB liegt die Mitte innerhalb des Ausschnitts. Bei CB ist sie mit 26,620 MHz nahe am unteren Bandrand.
 
@@ -73,9 +80,13 @@ Das Backend lauscht auf `127.0.0.1:50020` (TCP). Nachrichten sind UTF-8-JSON-Obj
 - `{"op":"get_setup"}` fordert die Einstellungen erneut an. Das Backend sendet sie auch beim Verbindungsaufbau.
 - `{"type":"setup","radio_ip":"192.168.10.133","pi_ip":"192.168.10.140","mode":"LSB","volume":35}` enthält die aktiven Einstellungen.
 - `{"op":"setup","pi_ip":"192.168.10.140","request_id":1}` übernimmt eine oder beide mitgegebenen IPv4-Adressen (`radio_ip` und `pi_ip`). Das Backend meldet das Ergebnis mit `{"type":"setup-result","request_id":1,"ok":true,"text":""}` und spiegelt dabei die optionale `request_id`.
+- `{"op":"rx_filter","low_hz":300,"high_hz":2700,"nr_percent":30,"request_id":1}` setzt den RX-Filter und die Rauschreduktion. Das Backend meldet seine Werte bei Verbindungsaufbau und nach Änderungen als `type:"rx-filter"`, mit der Request-ID und bei Bedarf einer Meldung in `text`.
+- `{"op":"rf_power","percent":25}` setzt den RF-POWER-Sollwert im Bereich 0 bis 100 über CI‑V. `{"type":"rf-power","percent":25,"text":""}` meldet den am IC-7610 gelesenen Wert. Bei fehlendem Rücklesewert steht dort `null`.
+- `{"op":"compressor","value":1}` schaltet den TX-Kompressor ein (`0` aus). `{"op":"preamp","value":2}` setzt den SUB-Vorverstärker (`0` aus, `1` Stufe 1, `2` Stufe 2). Das Backend meldet den Rücklesewert mit `{"type":"compressor","value":1,"text":""}` beziehungsweise `{"type":"preamp","value":2,"text":""}`. Bei fehlendem Rücklesewert steht dort `null`.
 - `{"op":"sideband","band":"40m","mode":"USB"}` wählt und speichert USB oder LSB für das ausgewählte Band. Beim Bandwechsel meldet das Backend die wiederhergestellte Einstellung mit `{"type":"sideband","band":"40m","mode":"USB"}`. `{"op":"volume","percent":35}` setzt die Lautstärke im Bereich 0 bis 100.
 - `{"op":"audio_output","output":"browser"}` schaltet Browser-Audio ein. `off` schaltet den Ton aus. Eine neue TCP-Verbindung beginnt mit ausgeschaltetem Ton.
 - `{"type":"audio","pcm":"…"}` enthält genau 960 Mono-Samples in PCM16 Little Endian, Base64-kodiert. `{"type":"audio-reset"}` verwirft gepuffertes Browser-Audio, etwa beim Wechsel der I/Q-Mitte.
+- `{"op":"ptt","action":"start","id":1,"mode":"toggle"}` fordert Rast-PTT mit Fünf-Minuten-Timeout an. `hold` ist der Standardmodus. `keepalive` und `stop` verwenden dieselbe ID. `{"op":"tx_audio","id":1,"pcm":"…"}` übergibt einen Base64-kodierten Block mit 320 PCM16-Mono-Samples bei 16 kHz. `{"type":"tx","phase":"tx","ready":true,"text":""}` meldet bestätigtes TX. Die Phase `rx` meldet bestätigten Empfang.
 
 ### Browser-WebSocket
 
@@ -90,5 +101,7 @@ Das Backend lauscht auf `127.0.0.1:50020` (TCP). Nachrichten sind UTF-8-JSON-Obj
 | 8 | MAIN-Mitte in Hz für Zoom, 0 für Fullband, Samplefrequenz 48000 für Audio, jeweils uint32 |
 | 12 | Band-ID mit bis zu 15 ASCII-Zeichen und Nullauffüllung, bei Audio nullgefüllt |
 | 28 | FFT-Pegel in Zehntel-dBFS oder PCM-Samples als int16 |
+
+Für Browser-Mikrofondaten nimmt die Bridge 648 Byte lange Binärnachrichten an. Auf `ICTX` und die vier Byte lange PTT-ID in Little Endian folgen 640 Byte Mono-PCM16 in Little Endian.
 
 Der Backend-Anschluss zum Pi folgt dem [bestehenden I/Q-Protokoll](../raspberry/README.md#tcp-format).

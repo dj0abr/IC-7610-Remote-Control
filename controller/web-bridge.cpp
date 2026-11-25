@@ -8,6 +8,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QtEndian>
+
+#include "icom-lan.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -107,7 +110,9 @@ bool isCommand(const QJsonObject& object)
     return op == QStringLiteral("band") || op == QStringLiteral("set_main") ||
         op == QStringLiteral("step_main") || op == QStringLiteral("get_setup") ||
         op == QStringLiteral("setup") || op == QStringLiteral("sideband") ||
-        op == QStringLiteral("volume") || op == QStringLiteral("audio_output");
+        op == QStringLiteral("volume") || op == QStringLiteral("audio_output") || op == QStringLiteral("rx_filter") ||
+        op == QStringLiteral("ptt") || op == QStringLiteral("rf_power") ||
+        op == QStringLiteral("compressor") || op == QStringLiteral("preamp");
 }
 
 class BrowserSession : public std::enable_shared_from_this<BrowserSession>
@@ -181,8 +186,27 @@ private:
 
         const std::string input = beast::buffers_to_string(m_incoming.data());
         m_incoming.consume(m_incoming.size());
-        const auto document = QJsonDocument::fromJson(QByteArray(input.data(), input.size()));
-        if (!m_socket.got_text() || !document.isObject() || !isCommand(document.object()))
+        QJsonDocument document;
+        if (m_socket.got_text())
+        {
+            document = QJsonDocument::fromJson(QByteArray(input.data(), input.size()));
+        }
+        else if (input.size() == 8 + icom::txAudioBytes && input.starts_with("ICTX"))
+        {
+            if (m_commandBytes > 4 * 1024)
+            {
+                readBrowser();
+                return;
+            }
+            const auto id = qFromLittleEndian<quint32>(input.data() + 4);
+            const QByteArray pcm(input.data() + 8, icom::txAudioBytes);
+            document = QJsonDocument(QJsonObject{
+                {QStringLiteral("op"), QStringLiteral("tx_audio")},
+                {QStringLiteral("id"), static_cast<double>(id)},
+                {QStringLiteral("pcm"), QString::fromLatin1(pcm.toBase64())},
+            });
+        }
+        if (!document.isObject() || (m_socket.got_text() && !isCommand(document.object())))
         {
             sendStatus("Ungültiger Steuerbefehl");
             readBrowser();
@@ -386,6 +410,8 @@ constexpr Asset assets[] = {
     {"/app.js", ":/web/app.js", "text/javascript; charset=utf-8"},
     {"/plots.js", ":/web/plots.js", "text/javascript; charset=utf-8"},
     {"/audio.js", ":/web/audio.js", "text/javascript; charset=utf-8"},
+    {"/tx-audio.js", ":/web/tx-audio.js", "text/javascript; charset=utf-8"},
+    {"/tx-worklet.js", ":/web/tx-worklet.js", "text/javascript; charset=utf-8"},
 };
 
 class HttpSession : public std::enable_shared_from_this<HttpSession>

@@ -11,10 +11,10 @@ find_package(Qt5 5.15 REQUIRED COMPONENTS Core Network)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFTW REQUIRED IMPORTED_TARGET fftw3f)
 
-set(LIQUID_ROOT "" CACHE PATH "Optional LiquidDSP installation root")
-find_path(LIQUID_INCLUDE_DIR liquid.h HINTS "${LIQUID_ROOT}" PATH_SUFFIXES include include/liquid liquid)
+set(LIQUID_ROOT "/Daten/funk/sat/QO100_Transceiver/libs" CACHE PATH "LiquidDSP installation root")
+find_path(LIQUID_INCLUDE_DIR liquid.h HINTS "${LIQUID_ROOT}/include" PATH_SUFFIXES liquid)
 find_library(LIQUID_LIBRARY NAMES liquid
-    HINTS "${LIQUID_ROOT}" PATH_SUFFIXES "${CMAKE_SYSTEM_PROCESSOR}" lib lib64)
+    HINTS "${LIQUID_ROOT}/${CMAKE_SYSTEM_PROCESSOR}" "${LIQUID_ROOT}/lib")
 if(NOT LIQUID_INCLUDE_DIR OR NOT LIQUID_LIBRARY)
     message(FATAL_ERROR "LiquidDSP nicht gefunden. LIQUID_ROOT oder LIQUID_INCLUDE_DIR und LIQUID_LIBRARY setzen.")
 endif()
@@ -25,11 +25,23 @@ set_target_properties(LiquidDSP PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${LIQUID_INCLUDE_DIR}")
 
 
+set(SPEEXDSP_ROOT "/Daten/funk/sat/QO100_TRX2/external/speexdsp-1.2.1" CACHE PATH "SpeexDSP bundle root")
+set(SPEEXDSP_ARCHIVE "${SPEEXDSP_ROOT}/lib/linux-${CMAKE_SYSTEM_PROCESSOR}/libspeexdsp.a")
+if(EXISTS "${SPEEXDSP_ARCHIVE}" AND EXISTS "${SPEEXDSP_ROOT}/include/speex/speex_preprocess.h")
+    add_library(SpeexDSP STATIC IMPORTED)
+    set_target_properties(SpeexDSP PROPERTIES IMPORTED_LOCATION "${SPEEXDSP_ARCHIVE}"
+        INTERFACE_INCLUDE_DIRECTORIES "${SPEEXDSP_ROOT}/include" INTERFACE_LINK_LIBRARIES m)
+    set(SPEEXDSP_TARGET SpeexDSP)
+else()
+    pkg_check_modules(SPEEXDSP REQUIRED IMPORTED_TARGET speexdsp)
+    set(SPEEXDSP_TARGET PkgConfig::SPEEXDSP)
+endif()
+
 add_library(icom-lan STATIC icom-lan.cpp)
 target_compile_options(icom-lan PRIVATE -Wall -Wextra -Wpedantic)
 
-add_executable(kmcontrol-backend backend.cpp main-control.cpp spectrum.cpp ssb-demod.cpp)
-target_link_libraries(kmcontrol-backend PRIVATE Qt5::Core Qt5::Network PkgConfig::FFTW LiquidDSP icom-lan)
+add_executable(kmcontrol-backend backend.cpp main-control.cpp spectrum.cpp ssb-demod.cpp rx-audio-filter.cpp)
+target_link_libraries(kmcontrol-backend PRIVATE Qt5::Core Qt5::Network PkgConfig::FFTW LiquidDSP ${SPEEXDSP_TARGET} icom-lan)
 target_compile_options(kmcontrol-backend PRIVATE -Wall -Wextra -Wpedantic)
 
 find_package(Boost 1.74 REQUIRED)

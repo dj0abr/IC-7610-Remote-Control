@@ -4,6 +4,13 @@ const startDelay = .075;
 const maxQueue = .2;
 const AudioContext = window.AudioContext || window.webkitAudioContext;
 
+export async function grantMicrophoneAccess() {
+  const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+}
+
 export class BrowserAudio {
   constructor() {
     this.sources = new Set();
@@ -44,29 +51,14 @@ export class BrowserAudio {
     return typeof AudioContext?.prototype.setSinkId === 'function';
   }
 
-  async outputDevices() {
-    if (!this.canSelectOutput || !navigator.mediaDevices?.enumerateDevices) {
-      return [];
-    }
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices.filter(device => device.kind === 'audiooutput' && device.label &&
-      device.deviceId && !['default', 'communications'].includes(device.deviceId))
-      .map(device => ({id: device.deviceId, label: device.label}));
-  }
-
   async requestOutputAccess() {
     const media = navigator.mediaDevices;
     if (media.selectAudioOutput) {
       const device = await media.selectAudioOutput();
-      return {selected: device.deviceId === 'default' ? '' : device.deviceId,
-        devices: await this.outputDevices()};
+      return device.deviceId === 'default' ? '' : device.deviceId;
     }
     // Chromium exposes the other outputs after microphone permission.
-    const stream = await media.getUserMedia({audio: true});
-    for (const track of stream.getTracks()) {
-      track.stop();
-    }
-    return {devices: await this.outputDevices()};
+    await grantMicrophoneAccess();
   }
 
   async setOutput(deviceId) {

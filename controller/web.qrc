@@ -5,5 +5,7 @@
     <file>web/app.js</file>
     <file>web/plots.js</file>
     <file>web/audio.js</file>
+    <file>web/tx-audio.js</file>
+    <file>web/tx-worklet.js</file>
   </qresource>
 </RCC>

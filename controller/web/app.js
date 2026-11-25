@@ -1,10 +1,23 @@
-import {BrowserAudio} from '/audio.js';
+import {BrowserAudio, grantMicrophoneAccess} from '/audio.js';
 import {PlotPair} from '/plots.js';
+import {Microphone} from '/tx-audio.js';
 
 const element = id => document.getElementById(id);
 const bandSelect = element('band');
 const modeSelect = element('sideband');
 const volume = element('volume');
+const filterLower = element('filter-lower');
+const filterUpper = element('filter-upper');
+const filterNoise = element('nr');
+const filterPresets = document.querySelectorAll('.filter-presets button');
+const filterError = element('filter-error');
+const rfPower = element('rf-power');
+const rfPowerValue = element('rf-power-value');
+const rfPowerError = element('rf-power-error');
+const radioOptions = {
+  compressor: {select: element('compressor'), error: element('compressor-error'), value: null, max: 1},
+  preamp: {select: element('preamp'), error: element('preamp-error'), value: null, max: 2},
+};
 const setup = element('setup');
 const addresses = ['radio-ip', 'pi-ip'].map(id => ({
   key: id.replace('-', '_'), input: element(id), error: element(`${id}-error`), pending: null,
@@ -12,10 +25,18 @@ const addresses = ['radio-ip', 'pi-ip'].map(id => ({
 const status = element('status');
 const audioButton = element('audio-toggle');
 const audioError = element('audio-error');
+const pttButton = element('ptt');
+const pttModeControl = element('ptt-mode');
+const pttHint = element('ptt-hint');
+const txIndicator = element('tx-state');
+const txError = element('tx-error');
 const browserSpeaker = element('browser-speaker');
+const browserMicrophone = element('browser-microphone');
 const allowAudioDevices = element('allow-audio-devices');
+const allowMicrophones = element('allow-microphones');
 const mediaDevices = navigator.mediaDevices;
 const audioDevicePicker = typeof mediaDevices?.selectAudioOutput === 'function';
+const canCapture = typeof mediaDevices?.getUserMedia === 'function';
 const lowerControl = element('lower');
 const upperControl = element('upper');
 const colorControl = element('color');
@@ -58,16 +79,32 @@ let mainHz = 0;
 let halfSpan = 30000;
 let spectrumLive = false;
 let setupState = null;
+let rxFilter = null;
+let filterTimer = 0;
+let filterRevision = 0;
 let nextSetupId = 0;
 let lastProblem = '';
+let confirmedPower = null;
+let editingPower = false;
 let audioEnabled = false;
 let audioStarting = false;
 let audioRouting = Promise.resolve();
 let browserDevices = [];
 let deviceRefresh = 0;
 let requestingDevices = false;
+let tx = {phase: 'offline', ready: false};
+let micStart = null;
+let microphoneError = '';
+let pttId = 0;
+let nextPttId = 0;
+let pttMode = preferences.pttMode === 'toggle' ? 'toggle' : 'hold';
+const pttSources = new Set();
 
 const audio = new BrowserAudio();
+const microphone = new Microphone(sendMicrophoneFrame, () => {
+  stopMicrophone();
+  setMicrophoneError('Mikrofonverbindung unterbrochen.');
+});
 const overview = new PlotPair(element('overview'), false, tuneMain, stepMain);
 const zoom = new PlotPair(element('zoom'), true, tuneMain, stepMain);
 
@@ -93,15 +130,166 @@ function send(command) {
 }
 
 function tuneMain(hz) {
-  if (spectrumLive) {
+  if (spectrumLive && !receivePaused() && !pttId) {
     send({op: 'set_main', hz});
   }
 }
 
 function stepMain(steps) {
-  if (spectrumLive) {
+  if (spectrumLive && !receivePaused() && !pttId) {
     send({op: 'step_main', steps});
   }
+}
+
+function receivePaused() {
+  return tx.phase !== 'rx' && tx.phase !== 'offline';
+}
+
+function showTxError(text) {
+  txError.value = text;
+  txError.hidden = !text;
+}
+
+function setMicrophoneError(text) {
+  microphoneError = text;
+  showTxError(tx.text || microphoneError);
+}
+
+function canStartPtt() {
+  return audioEnabled && microphone.ready && tx.ready && tx.phase === 'rx';
+}
+
+function renderTx() {
+  renderAudioButton();
+  renderRfPower();
+  renderRadioOptions();
+  pttButton.disabled = !pttId && !canStartPtt();
+  pttButton.setAttribute('aria-pressed', String(!!pttId));
+  pttHint.textContent = pttMode === 'toggle' ? 'Rasten · Leertaste' : 'Halten · Leertaste';
+  txIndicator.dataset.phase = tx.phase;
+  txIndicator.value = ({
+    rx: 'RX', starting: 'TX startet …', tx: 'TX', ending: 'RX wird geprüft …', unknown: 'RX prüfen',
+  })[tx.phase] || '';
+  bandSelect.disabled = !bands.length || !activeBand || receivePaused() || !!pttId;
+  renderDeviceControls();
+}
+
+function sendMicrophoneFrame(id, packet) {
+  if (pttId && id === pttId && socket?.readyState === WebSocket.OPEN && socket.bufferedAmount < 2048) {
+    socket.send(packet);
+  }
+}
+
+function pressPtt(source) {
+  if (pttSources.has(source)) {
+    return;
+  }
+  if (pttId) {
+    if (pttMode === 'toggle') {
+      stopPtt();
+    } else {
+      pttSources.add(source);
+    }
+    return;
+  }
+  if (!canStartPtt()) {
+    return;
+  }
+  const id = nextPttId = (nextPttId + 1) >>> 0 || 1;
+  if (!send({op: 'ptt', action: 'start', id, mode: pttMode})) {
+    return;
+  }
+  pttSources.add(source);
+  pttId = id;
+  showTxError('');
+  microphone.capture(id);
+  renderTx();
+}
+
+function releasePtt(source) {
+  const released = pttSources.delete(source);
+  if (released && pttMode === 'hold' && !pttSources.size) {
+    stopPtt();
+  }
+  return released;
+}
+
+function stopPtt() {
+  pttSources.clear();
+  if (!pttId) {
+    return;
+  }
+  const id = pttId;
+  pttId = 0;
+  microphone.capture(0);
+  send({op: 'ptt', action: 'stop', id});
+  renderTx();
+}
+
+function stopMicrophone() {
+  micStart = null;
+  stopPtt();
+  microphone.stop();
+  renderTx();
+}
+
+function preferredMicrophone() {
+  return typeof preferences.browserMicrophone === 'string' ? preferences.browserMicrophone : '';
+}
+
+async function startMicrophone() {
+  const device = preferredMicrophone();
+  const request = micStart = {};
+  setMicrophoneError('');
+  renderTx();
+  try {
+    await microphone.start(device);
+    void refreshBrowserDevices();
+  } catch (error) {
+    if (request !== micStart) {
+      return;
+    }
+    const missing = device && ['NotFoundError', 'OverconstrainedError'].includes(error.name);
+    if (missing) {
+      setMicrophoneError('Das gewählte Eingabegerät ist nicht verfügbar.');
+      void refreshBrowserDevices();
+    } else if (error.name === 'NotAllowedError') {
+      setMicrophoneError('Der Browser hat den Mikrofonzugriff blockiert. PTT ist deaktiviert.');
+    } else {
+      setMicrophoneError(error.message || 'Mikrofon konnte nicht geöffnet werden.');
+    }
+  } finally {
+    if (request === micStart) {
+      micStart = null;
+      renderTx();
+    }
+  }
+}
+
+function selectMicrophone() {
+  if (browserMicrophone.disabled) {
+    browserMicrophone.value = preferredMicrophone();
+    return;
+  }
+  preferences.browserMicrophone = browserMicrophone.value;
+  savePreferences();
+  if (audioEnabled) {
+    stopMicrophone();
+    void startMicrophone();
+  }
+}
+
+function updateTx(message) {
+  const previous = tx.phase;
+  tx = message;
+  if (!tx.ready || (tx.phase === 'rx' && (previous !== 'rx' || tx.text))) {
+    stopPtt();
+  }
+  showTxError(tx.text || microphoneError);
+  if (receivePaused()) {
+    audio.reset();
+  }
+  renderTx();
 }
 
 function setMain(hz) {
@@ -154,13 +342,116 @@ function setVolume(percent) {
   audio.setVolume(percent);
 }
 
+function renderRfPower() {
+  rfPower.disabled = confirmedPower === null || tx.phase !== 'rx' || !!pttId;
+  if (rfPower.disabled) {
+    editingPower = false;
+  }
+  if (!editingPower) {
+    rfPower.value = confirmedPower ?? 0;
+    rfPowerValue.value = confirmedPower === null ? '—' : `${confirmedPower} %`;
+  }
+}
+
+function updateRfPower(percent, text = '') {
+  confirmedPower = Number.isInteger(percent) && percent >= 0 && percent <= 100 ? percent : null;
+  rfPowerError.value = text;
+  rfPowerError.hidden = !text;
+  renderRfPower();
+}
+
+function renderRadioOptions() {
+  const busy = tx.phase !== 'rx' || !!pttId;
+  for (const option of Object.values(radioOptions)) {
+    option.select.disabled = busy || option.value === null;
+    option.select.value = option.value ?? '';
+  }
+}
+
+function updateRadioOption(option, value, text = '') {
+  option.value = Number.isInteger(value) && value >= 0 && value <= option.max ? value : null;
+  option.error.textContent = text;
+  option.error.hidden = !text;
+  renderRadioOptions();
+}
+
+function paintFilterRange(control) {
+  const min = Number(control.min);
+  const span = Number(control.max) - min;
+  control.style.setProperty('--fill', `${span > 0 ? (Number(control.value) - min) / span * 100 : 0}%`);
+}
+
+function renderFilter() {
+  const sideband = modeSelect.value;
+  element('filter-mode').textContent = sideband ? `MAIN · ${sideband}-Filter` : 'MAIN · RX-Filter';
+  for (const control of [filterLower, filterUpper, filterNoise, ...filterPresets]) {
+    control.disabled = !rxFilter;
+  }
+  const zoomLabel = element('zoom-filter');
+  zoomLabel.hidden = !rxFilter || !sideband;
+  if (!rxFilter) {
+    zoom.setPassband(0, 0);
+    return;
+  }
+
+  const {low_hz: low, high_hz: high, nr_percent: noise} = rxFilter;
+  const lowLabel = `${low.toLocaleString('de-DE')} Hz`;
+  const highLabel = `${high.toLocaleString('de-DE')} Hz`;
+  filterLower.max = high - 500;
+  filterUpper.min = low + 500;
+  filterLower.value = low;
+  filterUpper.value = high;
+  filterNoise.value = noise;
+  element('filter-lower-value').value = lowLabel;
+  element('filter-upper-value').value = highLabel;
+  element('filter-low').textContent = lowLabel;
+  element('filter-high').textContent = highLabel;
+  element('nr-value').value = `${noise} %`;
+  for (const control of [filterLower, filterUpper, filterNoise]) {
+    paintFilterRange(control);
+  }
+  for (const button of filterPresets) {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.bandwidth) === high - low));
+  }
+  zoomLabel.textContent = `${sideband} · ${low.toLocaleString('de-DE')}–${highLabel}`;
+  zoom.setPassband(sideband === 'LSB' ? -high : sideband === 'USB' ? low : 0,
+    sideband === 'LSB' ? -low : sideband === 'USB' ? high : 0);
+}
+
+function changeFilter(patch, delay = 100) {
+  if (!rxFilter) {
+    return;
+  }
+  clearTimeout(filterTimer);
+  rxFilter = {...rxFilter, ...patch};
+  const request = {op: 'rx_filter', ...rxFilter, request_id: ++filterRevision};
+  filterError.hidden = true;
+  renderFilter();
+  if (delay) {
+    filterTimer = setTimeout(() => send(request), delay);
+  } else {
+    send(request);
+  }
+}
+
+function installFilter(message) {
+  if (message.request_id != null && message.request_id !== filterRevision) {
+    return;
+  }
+  const {low_hz, high_hz, nr_percent} = message;
+  rxFilter = {low_hz, high_hz, nr_percent};
+  filterError.textContent = message.text;
+  filterError.hidden = !message.text;
+  renderFilter();
+}
+
 function showAudioError(text) {
   audioError.textContent = text;
   audioError.hidden = !text;
 }
 
 function renderAudioButton() {
-  audioButton.disabled = audioStarting || !setupState;
+  audioButton.disabled = audioStarting || !setupState || (requestingDevices && !audioEnabled);
   audioButton.textContent = audioStarting ? 'Audio startet …' : audioEnabled ? 'Audio ausschalten' : 'Audio einschalten';
   audioButton.setAttribute('aria-pressed', String(audioEnabled));
 }
@@ -198,9 +489,10 @@ function selectBrowserSpeaker(device) {
 
 function disableAudio() {
   audioEnabled = false;
+  stopMicrophone();
+  setMicrophoneError('');
   audio.stop();
   send({op: 'audio_output', output: 'off'});
-  renderAudioButton();
 }
 
 async function toggleAudio() {
@@ -209,21 +501,25 @@ async function toggleAudio() {
     disableAudio();
     return;
   }
+  const connection = socket;
   audioStarting = true;
-  renderAudioButton();
+  renderTx();
   try {
-    await audio.start();
+    // Start both audio contexts in the button's user gesture.
+    const playback = audio.start();
+    void startMicrophone();
+    await playback;
     await routeBrowserAudio();
-    if (!send({op: 'audio_output', output: 'browser'})) {
+    if (connection !== socket || !send({op: 'audio_output', output: 'browser'})) {
       throw new Error('Backend nicht verbunden.');
     }
     audioEnabled = true;
   } catch (error) {
-    audio.stop();
+    disableAudio();
     showAudioError(error.message || 'Audio konnte nicht gestartet werden.');
   } finally {
     audioStarting = false;
-    renderAudioButton();
+    renderTx();
   }
 }
 
@@ -239,6 +535,7 @@ function selectBand(id) {
   bandSelect.value = id;
   modeSelect.value = '';
   modeSelect.disabled = true;
+  renderFilter();
   overview.setBand(band);
   zoom.clear();
   restoreBandThresholds(id);
@@ -270,20 +567,43 @@ function installBands(message) {
   lowerControl.disabled = upperControl.disabled = false;
 }
 
-function renderBrowserDevices() {
-  const selected = preferredBrowserSpeaker();
-  browserSpeaker.replaceChildren(new Option('Systemstandard', ''));
-  for (const device of browserDevices) {
-    browserSpeaker.add(new Option(device.label, device.id));
+function fillDeviceSelect(select, selected, devices) {
+  select.replaceChildren(new Option('Systemstandard', ''));
+  for (const device of devices) {
+    select.add(new Option(device.label, device.deviceId));
   }
-  if (selected && !browserDevices.some(device => device.id === selected)) {
-    browserSpeaker.add(new Option('Gespeichertes Gerät (nicht verfügbar)', selected));
+  if (selected && !devices.some(device => device.deviceId === selected)) {
+    select.add(new Option('Gespeichertes Gerät (nicht verfügbar)', selected));
   }
-  browserSpeaker.value = selected;
+  select.value = selected;
+}
+
+function renderDeviceControls() {
+  const busy = !!micStart || requestingDevices || !!pttId || receivePaused();
+  const needInputs = canCapture && !microphone.ready && !browserDevices.some(device => device.kind === 'audioinput');
+  const needOutputs = audio.canSelectOutput && !browserDevices.some(device => device.kind === 'audiooutput');
   browserSpeaker.disabled = !audio.canSelectOutput;
-  element('browser-device-access').hidden = !audio.canSelectOutput ||
-    (!audioDevicePicker && (browserDevices.length > 0 || typeof mediaDevices?.getUserMedia !== 'function'));
+  browserMicrophone.disabled = !canCapture || busy;
+  allowMicrophones.hidden = !audioDevicePicker || !needInputs;
+  allowMicrophones.disabled = busy;
+  allowAudioDevices.disabled = audioDevicePicker ? requestingDevices : busy;
+  element('browser-device-access').hidden = audioDevicePicker ? !audio.canSelectOutput :
+    !canCapture || (!needInputs && !needOutputs);
   element('audio-device-hint').hidden = audioDevicePicker;
+}
+
+function renderBrowserDevices() {
+  fillDeviceSelect(browserSpeaker, preferredBrowserSpeaker(),
+    audio.canSelectOutput ? browserDevices.filter(device => device.kind === 'audiooutput') : []);
+  fillDeviceSelect(browserMicrophone, preferredMicrophone(),
+    browserDevices.filter(device => device.kind === 'audioinput'));
+  renderDeviceControls();
+}
+
+async function listBrowserDevices() {
+  const devices = await mediaDevices?.enumerateDevices?.() || [];
+  return devices.filter(device => device.label && device.deviceId &&
+    !['default', 'communications'].includes(device.deviceId));
 }
 
 function showBrowserDeviceError(text) {
@@ -298,7 +618,7 @@ async function refreshBrowserDevices() {
   }
   const refresh = ++deviceRefresh;
   try {
-    const devices = await audio.outputDevices();
+    const devices = await listBrowserDevices();
     if (refresh === deviceRefresh) {
       browserDevices = devices;
       renderBrowserDevices();
@@ -306,26 +626,32 @@ async function refreshBrowserDevices() {
     }
   } catch {
     if (refresh === deviceRefresh) {
-      showBrowserDeviceError('Die Wiedergabegeräte konnten nicht geladen werden.');
+      showBrowserDeviceError('Die Audiogeräte konnten nicht geladen werden.');
     }
   }
 }
 
-async function grantBrowserDevices() {
+async function grantBrowserDevices(inputOnly = false) {
   ++deviceRefresh;
-  requestingDevices = allowAudioDevices.disabled = true;
+  requestingDevices = true;
+  renderTx();
   showBrowserDeviceError('');
   try {
-    const {devices, selected} = await audio.requestOutputAccess();
-    browserDevices = devices;
-    if (selected !== undefined) {
-      selectBrowserSpeaker(selected);
+    if (inputOnly) {
+      await grantMicrophoneAccess();
+    } else {
+      const selected = await audio.requestOutputAccess();
+      if (selected !== undefined) {
+        selectBrowserSpeaker(selected);
+      }
     }
+    browserDevices = await listBrowserDevices();
     renderBrowserDevices();
   } catch {
-    showBrowserDeviceError('Der Browser hat keine weiteren Wiedergabegeräte freigegeben.');
+    showBrowserDeviceError('Der Browser hat keine weiteren Audiogeräte freigegeben.');
   } finally {
-    requestingDevices = allowAudioDevices.disabled = false;
+    requestingDevices = false;
+    renderTx();
   }
 }
 
@@ -342,10 +668,7 @@ function installSetup(message) {
   }
   setVolume(message.volume);
   volume.disabled = false;
-  if (audioEnabled) {
-    send({op: 'audio_output', output: 'browser'});
-  }
-  renderAudioButton();
+  renderTx();
 }
 
 function showAddressError(address, text, invalid = false) {
@@ -406,7 +729,7 @@ function handleState(message) {
   if (message.phase === 'error' && !message.band) {
     lastProblem = message.text;
   }
-  if (message.phase !== 'live' && message.phase !== 'idle') {
+  if (!receivePaused() && message.phase !== 'live' && message.phase !== 'idle') {
     resetPlots();
     audio.reset();
   }
@@ -414,6 +737,9 @@ function handleState(message) {
 
 function control(message) {
   switch (message.type) {
+    case 'tx':
+      updateTx(message);
+      break;
     case 'bands':
       installBands(message);
       break;
@@ -423,11 +749,22 @@ function control(message) {
     case 'setup':
       installSetup(message);
       break;
+    case 'rf-power':
+      updateRfPower(message.percent, message.text);
+      break;
+    case 'compressor':
+    case 'preamp':
+      updateRadioOption(radioOptions[message.type], message.value, message.text);
+      break;
     case 'sideband':
       if (message.band === activeBand?.id && ['USB', 'LSB'].includes(message.mode)) {
         modeSelect.value = message.mode;
         modeSelect.disabled = false;
+        renderFilter();
       }
+      break;
+    case 'rx-filter':
+      installFilter(message);
       break;
     case 'setup-result':
       setupResult(message);
@@ -451,6 +788,9 @@ function control(message) {
 }
 
 function binary(data) {
+  if (receivePaused()) {
+    return;
+  }
   if (data.byteLength < headerBytes) {
     return;
   }
@@ -520,12 +860,20 @@ function connect() {
     volume.disabled = true;
     activeBand = null;
     setupState = null;
+    tx = {phase: 'offline', ready: false};
+    clearTimeout(filterTimer);
+    rxFilter = null;
+    filterError.hidden = true;
+    renderFilter();
+    updateRfPower(null);
+    for (const option of Object.values(radioOptions)) {
+      updateRadioOption(option, null);
+    }
+    disableAudio();
     for (const address of addresses) {
       address.input.disabled = true;
       address.pending = null;
     }
-    audio.reset();
-    renderAudioButton();
     setMain(0);
     resetPlots();
     setStatus(lastProblem || 'Verbindung getrennt · neuer Versuch …', 'error');
@@ -540,12 +888,44 @@ bandSelect.addEventListener('change', () => selectBand(bandSelect.value));
 modeSelect.addEventListener('change', () => {
   if (activeBand) {
     send({op: 'sideband', band: activeBand.id, mode: modeSelect.value});
+    renderFilter();
   }
 });
+filterLower.addEventListener('input', () => changeFilter({low_hz: Number(filterLower.value)}));
+filterUpper.addEventListener('input', () => changeFilter({high_hz: Number(filterUpper.value)}));
+filterNoise.addEventListener('input', () => changeFilter({nr_percent: Number(filterNoise.value)}));
+for (const button of filterPresets) {
+  button.addEventListener('click', () => {
+    const bandwidth = Number(button.dataset.bandwidth);
+    const low = Math.min(Number(filterLower.value), 4000 - bandwidth);
+    changeFilter({low_hz: low, high_hz: low + bandwidth}, 0);
+  });
+}
 volume.addEventListener('input', () => {
   const percent = Number(volume.value);
   setVolume(percent);
   send({op: 'volume', percent});
+});
+for (const [op, option] of Object.entries(radioOptions)) {
+  option.select.addEventListener('change', () => {
+    if (option.select.disabled || !send({op, value: Number(option.select.value)})) {
+      renderRadioOptions();
+    }
+  });
+}
+rfPower.addEventListener('input', () => {
+  editingPower = true;
+  rfPowerValue.value = `${rfPower.value} %`;
+});
+rfPower.addEventListener('change', () => {
+  editingPower = false;
+  if (rfPower.disabled || !send({op: 'rf_power', percent: Number(rfPower.value)})) {
+    renderRfPower();
+  }
+});
+rfPower.addEventListener('pointercancel', () => {
+  editingPower = false;
+  renderRfPower();
 });
 lowerControl.addEventListener('input', () => {
   saveBandThresholds(Number(lowerControl.value), Number(upperControl.value));
@@ -562,9 +942,77 @@ colorControl.addEventListener('change', () => {
   savePreferences();
 });
 audioButton.addEventListener('click', toggleAudio);
+pttModeControl.value = pttMode;
+pttModeControl.addEventListener('change', () => {
+  stopPtt();
+  pttMode = pttModeControl.value;
+  preferences.pttMode = pttMode;
+  savePreferences();
+  renderTx();
+});
+pttButton.addEventListener('pointerdown', event => {
+  if (event.button === 0 && pttMode === 'hold') {
+    event.preventDefault();
+    pttButton.setPointerCapture(event.pointerId);
+    pressPtt(event.pointerId);
+  }
+});
+for (const eventName of ['pointerup', 'lostpointercapture']) {
+  pttButton.addEventListener(eventName, event => releasePtt(event.pointerId));
+}
+pttButton.addEventListener('pointercancel', stopPtt);
+pttButton.addEventListener('contextmenu', event => event.preventDefault());
+pttButton.addEventListener('click', () => {
+  if (pttMode === 'toggle') {
+    pressPtt('click');
+    releasePtt('click');
+  }
+});
+
+function pttKey(event) {
+  if (event.code === 'Space' || event.key === ' ') {
+    return 'Space';
+  }
+  return event.key === 'Enter' ? 'Enter' : null;
+}
+
+window.addEventListener('keydown', event => {
+  const key = pttKey(event);
+  const target = event.target;
+  if (!key || (key === 'Enter' && target !== pttButton) || pttButton.disabled ||
+      event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey ||
+      target.isContentEditable || target.closest?.('input, textarea, select, summary') ||
+      (!pttId && target.closest?.('.filter-presets button'))) {
+    return;
+  }
+  event.preventDefault();
+  if (!event.repeat) {
+    pressPtt(key);
+  }
+});
+window.addEventListener('keyup', event => {
+  const key = pttKey(event);
+  if (key && releasePtt(key)) {
+    event.preventDefault();
+  }
+});
+window.addEventListener('blur', stopPtt);
+window.addEventListener('pagehide', disableAudio);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopPtt();
+  }
+});
+setInterval(() => {
+  if (pttId) {
+    send({op: 'ptt', action: 'keepalive', id: pttId});
+  }
+}, 250);
 allowAudioDevices.textContent = audioDevicePicker ? 'Wiedergabegerät freigeben …' : 'Soundkarten freigeben …';
-allowAudioDevices.addEventListener('click', grantBrowserDevices);
+allowAudioDevices.addEventListener('click', () => grantBrowserDevices());
+allowMicrophones.addEventListener('click', () => grantBrowserDevices(true));
 browserSpeaker.addEventListener('change', () => selectBrowserSpeaker(browserSpeaker.value));
+browserMicrophone.addEventListener('change', selectMicrophone);
 mediaDevices?.addEventListener('devicechange', refreshBrowserDevices);
 setup.addEventListener('toggle', refreshBrowserDevices);
 for (const address of addresses) {
@@ -577,8 +1025,11 @@ for (const address of addresses) {
     }
   });
 }
-element('receive-menu').open = !matchMedia('(max-width: 730px)').matches;
+const openDesktopMenus = !matchMedia('(max-width: 730px)').matches;
+element('receive-menu').open = openDesktopMenus;
+element('filter-menu').open = openDesktopMenus;
 
 renderBrowserDevices();
+renderTx();
 restoreBandThresholds(preferredBand);
 connect();
