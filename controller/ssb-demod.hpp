@@ -26,6 +26,7 @@ public:
 
     bool ready() const;
     void tune(int offsetHz, Sideband sideband);
+    void resetVoice();
     void setFrequencyOffset(int offsetHz);
     bool setRxFilter(RxFilterSettings settings);
     bool autoNotchAvailable() const { return m_notch.autoAvailable(); }
@@ -33,7 +34,8 @@ public:
     int detectedNotchHz() const { return m_notch.detectedHz(); }
     void clearNotchDetection() { m_notch.clearDetection(); }
     void setNoiseReduction(int percent);
-    std::span<const float> process(const char* data, int bytes);
+    std::span<const float> process(const char* data, int bytes, bool voice = true, bool digital = false);
+    std::span<const float> digitalAudio() const { return m_digitalAudio; }
 
 private:
     float detectAudio(const std::complex<float>& sample);
@@ -46,6 +48,7 @@ private:
     firdecim_crcf m_second;
     firdecim_crcf m_third;
     RxAudioFilter m_filter;
+    RxAudioFilter m_digitalFilter;
     RxNotch m_notch;
     firinterp_rrrf m_interpolator;
     int m_offsetHz = 0;
@@ -64,4 +67,5 @@ private:
     std::vector<std::complex<float>> m_at48k;
     std::vector<std::complex<float>> m_at12k;
     std::vector<float> m_audio;
+    std::vector<float> m_digitalAudio;
 };

@@ -7,5 +7,11 @@
     <file>web/audio.js</file>
     <file>web/tx-audio.js</file>
     <file>web/tx-worklet.js</file>
+    <file>web/ft-panel.js</file>
+    <file>web/ft-qso.js</file>
+    <file>web/dxcc.js</file>
+    <file>web/dxcc-data.js</file>
+    <file>web/dxcc-flags.png</file>
+    <file>web/dxcc-LICENSE.txt</file>
   </qresource>
 </RCC>

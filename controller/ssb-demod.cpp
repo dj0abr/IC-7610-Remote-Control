@@ -78,7 +78,8 @@ SsbDemodulator::~SsbDemodulator()
 
 bool SsbDemodulator::ready() const
 {
-    return m_oscillator && m_first && m_second && m_third && m_filter.ready() && m_interpolator && m_noiseReduction;
+    return m_oscillator && m_first && m_second && m_third && m_filter.ready() &&
+           m_digitalFilter.ready() && m_interpolator && m_noiseReduction;
 }
 
 void SsbDemodulator::tune(int offsetHz, Sideband sideband)
@@ -88,16 +89,22 @@ void SsbDemodulator::tune(int offsetHz, Sideband sideband)
     firdecim_crcf_reset(m_first);
     firdecim_crcf_reset(m_second);
     firdecim_crcf_reset(m_third);
-    firinterp_rrrf_reset(m_interpolator);
     m_sideband = sideband;
+    m_digitalFilter.reset();
+    resetVoice();
+    m_iq.clear();
+    m_at192k.clear();
+}
+
+void SsbDemodulator::resetVoice()
+{
+    firinterp_rrrf_reset(m_interpolator);
     m_filter.reset();
     m_notch.reset();
     resetNoiseReduction();
     m_voiceCount = 0;
     m_voicePower = minimumVoicePower;
     m_outputPeak = outputPeakLimit;
-    m_iq.clear();
-    m_at192k.clear();
 }
 
 void SsbDemodulator::setFrequencyOffset(int offsetHz)
@@ -106,6 +113,7 @@ void SsbDemodulator::setFrequencyOffset(int offsetHz)
     {
         m_offsetHz = offsetHz;
         m_notch.clearDetection();
+        m_digitalFilter.reset();
     }
     nco_crcf_set_frequency(m_oscillator, radiansPerCycle * offsetHz / inputRate);
 }
@@ -196,8 +204,9 @@ float SsbDemodulator::limitAudio(float sample)
     return sample * (outputPeakLimit / m_outputPeak);
 }
 
-std::span<const float> SsbDemodulator::process(const char* data, int bytes)
+std::span<const float> SsbDemodulator::process(const char* data, int bytes, bool voice, bool digital)
 {
+    m_digitalAudio.clear();
     const auto* raw = reinterpret_cast<const uchar*>(data);
     const auto retained = m_iq.size();
     const unsigned int samples = bytes / 4;
@@ -223,6 +232,10 @@ std::span<const float> SsbDemodulator::process(const char* data, int bytes)
     m_at12k.resize(voiceSamples);
     m_audio.clear();
     m_audio.reserve((m_voiceCount + voiceSamples) / voiceBlockSamples * voiceBlockSamples * interpolation);
+    if (digital)
+    {
+        m_digitalAudio.reserve(voiceSamples);
+    }
 
     nco_crcf_mix_block_down(m_oscillator, m_iq.data(), m_iq.data(), used);
     firdecim_crcf_execute_block(m_first, m_iq.data(), m_at192k.size(), m_at192k.data());
@@ -230,6 +243,14 @@ std::span<const float> SsbDemodulator::process(const char* data, int bytes)
     firdecim_crcf_execute_block(m_third, m_at48k.data(), voiceSamples, m_at12k.data());
     for (auto sample : m_at12k)
     {
+        if (digital)
+        {
+            m_digitalAudio.push_back(2.0f * m_digitalFilter.execute(sample).real());
+        }
+        if (!voice)
+        {
+            continue;
+        }
         // Conjugating LSB mirrors its negative-frequency passband into the same FIR.
         if (m_sideband == Sideband::Lsb)
         {

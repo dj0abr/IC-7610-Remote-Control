@@ -747,6 +747,73 @@ public:
                !data.empty() && data[0] == 0;
     }
 
+    bool digitalTxMode()
+    {
+        const auto split = exchangeCiv(std::array<Byte, 1>{0x0f}, false, 1, 120ms);
+        return split.size() == 1 && split[0] == 0 && mainUsbFilterPreset().has_value();
+    }
+
+    std::optional<int> mainUsbFilterPreset()
+    {
+        const auto main = exchangeCiv(std::array<Byte, 2>{0x26, 0x00}, false, 1, 120ms);
+        if (main.size() != 3 || main[2] < 1 || main[2] > 3)
+        {
+            throw std::runtime_error("Ungültige MAIN-Filtereinstellung vom IC-7610.");
+        }
+        return main[0] == 1 && main[1] == 0 ? std::optional<int>(main[2]) : std::nullopt;
+    }
+
+    void setMainUsbFilterPreset(int preset)
+    {
+        exchangeCiv(std::array<Byte, 5>{0x26, 0x00, 0x01, 0x00, static_cast<Byte>(preset)},
+                    true, 1, 160ms, false);
+    }
+
+    int mainIfFilterWidthCode()
+    {
+        const int code = readSwitch(std::array<Byte, 4>{0x29, 0x00, 0x1a, 0x03}, maxSsbIfFilterWidthCode);
+        if ((code & 0x0f) > 9)
+        {
+            throw std::runtime_error("Ungültige MAIN-Filterbreite vom IC-7610.");
+        }
+        return code;
+    }
+
+    void setMainIfFilterWidthCode(int widthCode)
+    {
+        exchangeCiv(std::array<Byte, 5>{0x29, 0x00, 0x1a, 0x03, static_cast<Byte>(widthCode)},
+                    true, 1, 160ms, false);
+    }
+
+    std::array<int, 2> mainTwinPbt()
+    {
+        std::array<int, 2> positions{};
+        for (std::size_t i = 0; i < positions.size(); ++i)
+        {
+            const auto control = static_cast<Byte>(0x07 + i);
+            const auto reply = exchangeCiv(std::array<Byte, 4>{0x29, 0x00, 0x14, control}, false, 1, 120ms);
+            const auto position = decodeCivLevel(reply);
+            if (!position)
+            {
+                throw std::runtime_error("Ungültige MAIN-Twin-PBT-Position vom IC-7610.");
+            }
+            positions[i] = *position;
+        }
+        return positions;
+    }
+
+    void setMainTwinPbt(const std::array<int, 2>& positions)
+    {
+        for (std::size_t i = 0; i < positions.size(); ++i)
+        {
+            const int value = positions[i];
+            const auto control = static_cast<Byte>(0x07 + i);
+            const auto high = static_cast<Byte>(value / 100);
+            const auto low = static_cast<Byte>(((value / 10 % 10) << 4) | (value % 10));
+            exchangeCiv(std::array<Byte, 6>{0x29, 0x00, 0x14, control, high, low}, true, 1, 160ms, false);
+        }
+    }
+
     void setPtt(bool pressed)
     {
         if (pressed)
@@ -1094,6 +1161,13 @@ void LanRadio::service()
 bool LanRadio::txAudioReady() const { return m_impl->radio.txAudioReady(); }
 bool LanRadio::transmitting() { return m_impl->radio.transmitting(); }
 bool LanRadio::voiceTxMode() { return m_impl->radio.voiceTxMode(); }
+bool LanRadio::digitalTxMode() { return m_impl->radio.digitalTxMode(); }
+std::optional<int> LanRadio::mainUsbFilterPreset() { return m_impl->radio.mainUsbFilterPreset(); }
+void LanRadio::setMainUsbFilterPreset(int preset) { m_impl->radio.setMainUsbFilterPreset(preset); }
+int LanRadio::mainIfFilterWidthCode() { return m_impl->radio.mainIfFilterWidthCode(); }
+void LanRadio::setMainIfFilterWidthCode(int widthCode) { m_impl->radio.setMainIfFilterWidthCode(widthCode); }
+std::array<int, 2> LanRadio::mainTwinPbt() { return m_impl->radio.mainTwinPbt(); }
+void LanRadio::setMainTwinPbt(const std::array<int, 2>& positions) { m_impl->radio.setMainTwinPbt(positions); }
 void LanRadio::setPtt(bool pressed) { m_impl->radio.setPtt(pressed); }
 void LanRadio::releasePtt() noexcept { m_impl->radio.releasePtt(); }
 void LanRadio::sendTxAudio(std::span<const char> pcm) { m_impl->radio.sendTxAudio(pcm); }

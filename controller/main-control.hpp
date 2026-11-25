@@ -7,6 +7,7 @@
 #include <QObject>
 #include <QTimer>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -25,12 +26,15 @@ public:
     void pttInput(quint64 session, quint32 id, const QString& action, bool latched);
     void txAudioInput(quint64 session, quint32 id, QByteArray pcm);
     void cancelPtt();
+    void scheduleDigitalTx(quint64 session, quint64 id, qint64 dialHz, qint64 audioUtcMs, QByteArray pcm);
+    void cancelDigitalTx(quint64 id) { m_cancelDigitalId.store(id); }
 
 public slots:
     void start(const QString& address, quint64 session);
     void stop();
     void tune(qint64 lowHz, qint64 highHz, quint64 revision);
     void setRadioSetting(quint64 session, int index, int value);
+    void setFtRadioSettings(quint64 session, bool active);
     void bandChanged(quint64 session);
 
 signals:
@@ -40,6 +44,8 @@ signals:
     void rxMeterChanged(quint64 session, int level);
     void txMetersChanged(quint64 session, int power, int swr);
     void txChanged(quint64 session, const QString& phase, bool ready, const QString& text);
+    void digitalTxChanged(quint64 session, quint64 id, const QString& phase,
+                          const QString& result, const QString& text);
 
 private:
     struct TuneRequest
@@ -61,9 +67,24 @@ private:
     };
 
     void updateRadioSettings(qint64 now);
+    int applyFtCompressor();
+    void applyFtUsbFilter();
     void applyMicGain();
     qint64 writeFrequency(const TuneRequest& request);
     using Clock = std::chrono::steady_clock;
+
+    struct DigitalTx
+    {
+        quint64 id;
+        qint64 dialHz;
+        qint64 audioUtcMs;
+        Clock::time_point audioAt;
+        QByteArray pcm;
+        int position = 0;
+        bool keyed = false;
+    };
+    bool processDigitalTx(Clock::time_point now, bool settingWritePending);
+    void finishDigitalTx(const QString& result, const QString& text = {});
 
     struct PttRequest
     {
@@ -93,6 +114,16 @@ private:
     std::unique_ptr<icom::LanRadio> m_radio;
     std::optional<TuneRequest> m_requested;
     std::array<SettingState, RadioSettingCount> m_radioSettings{};
+    bool m_ftRadioSettingsActive = false;
+    std::optional<int> m_compressorBeforeFt;
+    struct UsbFilter
+    {
+        int preset;
+        int widthCode;
+        std::array<int, 2> twinPbt;
+    };
+    std::optional<UsbFilter> m_usbFilterBeforeFt;
+    qint64 m_nextFtFilterRead = 0;
     std::optional<qint64> m_micGainDue;
     quint64 m_session = 0;
     quint64 m_completedRevision = 0;
@@ -110,6 +141,8 @@ private:
     std::optional<int> m_pendingPo;
     std::mutex m_txMutex;
     TxInput m_input;
+    std::optional<DigitalTx> m_digitalTx;
+    std::atomic<quint64> m_cancelDigitalId{0};
     QString m_txPhase;
     QString m_txText;
     bool m_txReady = false;

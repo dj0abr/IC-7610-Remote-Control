@@ -17,14 +17,14 @@ Der [Quellenindex](../doc/Quellen.md) verlinkt die CI-V-Referenz von Icom, die w
 
 ## Backend und WebGUI
 
-Das Backend und die HTTP-/WebSocket-Bridge sind C++20-Programme. Der Build verwendet CMake, Boost, Qt 5.15, FFTW für einfache Genauigkeit (fftw3f), LiquidDSP und SpeexDSP. CMake verwendet standardmäßig die vorhandene LiquidDSP-Installation des QO100-Transceivers und das SpeexDSP-Bundle aus QO100_TRX2. Andere Pfade lassen sich mit `-DLIQUID_ROOT=/pfad/zu/libs` und `-DSPEEXDSP_ROOT=/pfad/zum/bundle` setzen. Ohne passendes SpeexDSP-Bundle verwendet der Build das per pkg-config installierte SpeexDSP-Entwicklungspaket.
+Das Backend und die HTTP-/WebSocket-Bridge sind C++20-Programme. Der Build verwendet CMake ab 3.20, GNU Fortran für den FT-Decoder, Boost, Qt 5.15, FFTW für einfache Genauigkeit (fftw3f), LiquidDSP und SpeexDSP. CMake verwendet standardmäßig die vorhandene LiquidDSP-Installation des QO100-Transceivers und das SpeexDSP-Bundle aus QO100_TRX2. Andere Pfade lassen sich mit `-DLIQUID_ROOT=/pfad/zu/libs` und `-DSPEEXDSP_ROOT=/pfad/zum/bundle` setzen. Ohne passendes SpeexDSP-Bundle verwendet der Build das per pkg-config installierte SpeexDSP-Entwicklungspaket.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-Bei einer Einrichtung mit privatem Neustartskript startet `./restart-local.sh` die vorgebauten Programme im Projektordner neu. Das private Skript übergibt die Funkgeräte-Zugangsdaten an das Backend. Die Startprotokolle stehen unter `.kmcontrol-run/`.
+Bei einer Einrichtung mit privatem Neustartskript startet `./restart-local.sh` die vorgebauten Programme im Projektordner neu. Das private Skript übergibt die Funkgeräte-Zugangsdaten an das Backend. Die Startprotokolle stehen unter `.kmcontrol-run/`. Für FT4/FT8 muss das mitgebaute Programm `ft8-decoder` im selben Verzeichnis wie `kmcontrol-backend` liegen.
 
 Für einen manuellen Start `KMCONTROL_ICOM_USER` und `KMCONTROL_ICOM_PASSWORD` in der Umgebung von `./build/kmcontrol-backend` setzen. In einem zweiten Terminal `./build/kmcontrol-web` starten und [kmcontrol im Browser öffnen](http://127.0.0.1:8086/). `kmcontrol-web --port PORT` wählt einen anderen lokalen HTTP-/WebSocket-Port. Die Bridge lauscht auf dem Rechner mit dem Backend unter `127.0.0.1`. Sie liefert die eingebetteten Browserdateien und verbindet `/ws` mit dem TCP-Backend auf `127.0.0.1:50020`. Die Browseroberfläche gibt Bedienbefehle als JSON weiter und zeichnet beide FFT-Ansichten mit Canvas.
 
@@ -68,6 +68,20 @@ Unter **Filter → Notch** stehen **Aus**, **Man** und **Auto** zur Auswahl. Im 
 
 Die Empfangsausschnitte folgen dem [IARU-Region-1-HF-Bandplan](https://www.iaru-r1.org/wp-content/uploads/2019/08/hf_r1_bandplan.pdf). 10 m verwendet die gewünschten Anzeigeabschnitte 28–29 und 29–30 MHz. Der CB-Ausschnitt umfasst [alle 80 deutschen CB-Kanäle](https://www.bundesnetzagentur.de/865198). Die Ränder sind mit 5 bis 25 kHz Reserve schattiert. Bei 160 bis 12 m liegt die Mitte 15 kHz unter dem unteren Anzeigerand. Bei 10 m und CB liegt die Mitte innerhalb des Ausschnitts. Bei CB ist sie mit 26,620 MHz nahe am unteren Bandrand.
 
+### FT4 und FT8
+
+Unter **Empfangsansicht → FT4/FT8** erscheint die Digitalkachel anstelle des Zooms. Beim Öffnen sowie bei einem Wechsel von FT-Betriebsart oder Band stimmt MAIN automatisch auf die hinterlegte Standardfrequenz ab. Die Kachel zeigt einen 0–4-kHz-Wasserfall, UTC-Slotfortschritt, alle empfangenen Decodes und eine Liste für das eigene Rufzeichen. Eine synchronisierte UTC-Systemuhr am Backend ist für die 15-s-Slots (FT8) und 7,5-s-Slots (FT4) erforderlich. [WSJT-X-Standardfrequenzen](https://github.com/WSJTX/wsjtx/blob/master/models/FrequencyList.cpp)
+
+Die Dekodierung verwendet USB-Audio mit 12 kHz direkt aus dem I/Q-Strom, vor der Sprach-AGC, dem Notch und Speex. Sie läuft auch bei ausgeschaltetem Browser-Audio. FT8 versucht nach 11,808 Sekunden eine frühe Dekodierung und ergänzt Treffer am Slotende. Die Rechenprozesse laufen getrennt vom Empfang. Die übernommenen WSJT-X-Quellen und ihre Lizenz liegen unter [external/ft8](external/ft8/ORIGIN.md).
+
+Beim Öffnen der FT-Ansicht werden Notch, Rauschreduktion und der TX-Kompressor am IC-7610 vorübergehend ausgeschaltet. Das aktive MAIN-ZF-Filter wird in USB ohne DATA auf die maximale Breite von 3,6 kHz gesetzt. Twin PBT wird dabei zentriert. Beim Wechsel zurück zu Zoom werden die vorherigen Werte wiederhergestellt. Bestätigte Aussendungen erscheinen in **Nachrichten mit eigenem Rufzeichen** mit dem Kennzeichen **TX**.
+
+Für FT-TX MAIN am IC-7610 auf USB ohne DATA und ohne Split stellen. `DATA OFF MOD = LAN` muss aktiv sein. **Einmal senden** plant die eingegebene Nachricht in der gewählten UTC-Slotfolge. Der 16-kHz-Ton wird im Backend erzeugt und per LAN übertragen. **TX-Pegel** regelt die Amplitude des Tons. Der Regler **Sendeleistung** steuert die HF-Leistung am Gerät. Die erste PCM-Übergabe erfolgt 500 ms nach Beginn des Slots.
+
+Mit **Auto-QSO** startet ein Klick auf eine empfangene CQ-Zeile das QSO. **Auto-Antwort** nimmt an das eigene Rufzeichen gerichtete Anrufe an. **Auto-CQ** ruft in der gewählten Slotfolge und lässt den Gegenslot frei. **Auto-CQ-Antwort** wählt CQ-Rufe von Stationen, die in den letzten 72 Stunden im ADIF-Logbuch fehlen. **Abbrechen**, der Wechsel zurück zu Zoom, eine neue MAIN-Frequenz oder der Verbindungsverlust beenden die Automatik. Nach einem Neustart oder Neuladen müssen automatische Rufe oder Antworten erneut aktiviert werden.
+
+QSOs mit ausgetauschten Rapporten werden in `ft4-ft8.adi` im lokalen Datenverzeichnis des Backends gespeichert. Unter Linux ist das standardmäßig `~/.local/share/kmcontrol/kmcontrol-backend/`. Das Logbuch hält die tatsächlichen Audiofrequenzversätze in den RX- und TX-Frequenzen fest.
+
 ### TCP-Schnittstelle der Web-Bridge
 
 Das Backend lauscht auf `127.0.0.1:50020` (TCP). Nachrichten sind UTF-8-JSON-Objekte, jeweils mit einem LF abgeschlossen. Frequenzen werden in Hz angegeben.
@@ -86,6 +100,7 @@ Das Backend lauscht auf `127.0.0.1:50020` (TCP). Nachrichten sind UTF-8-JSON-Obj
 - `{"op":"setup","pi_ip":"192.168.10.140","request_id":1}` übernimmt eine oder beide mitgegebenen IPv4-Adressen (`radio_ip` und `pi_ip`). Das Backend meldet das Ergebnis mit `{"type":"setup-result","request_id":1,"ok":true,"text":""}` und spiegelt dabei die optionale `request_id`.
 - `{"op":"rx_filter","low_hz":300,"high_hz":2700,"nr_percent":30,"request_id":1}` setzt den RX-Filter und die Rauschreduktion. Das Backend meldet seine Werte bei Verbindungsaufbau und nach Änderungen als `type:"rx-filter"`, mit der Request-ID und bei Bedarf einer Meldung in `text`.
 - Derselbe Befehl akzeptiert optional `"notch_mode":"off"` (oder `"manual"`, `"auto"`) und `"notch_hz":1000`. Die Antwort enthält die Notch-Einstellungen und `notch_detected_hz`. Im Auto-Modus signalisiert `{"type":"notch-frequency","hz":1234}` eine neue erkannte Frequenz. Ohne erkannten Ton ist der Wert `null`.
+- `ft_mode` wählt mit `mode` den Decoder (`FT8`, `FT4` oder `off`). `ft-state` meldet den Decoderzustand und `ft-decode` die Ergebnisse mit Dialfrequenz und UTC-Slot. `ft8_tx_start` plant eine Aussendung, `ft8_tx_stop` bricht sie ab und `ft-tx` meldet Status und Slot. `ft_qso_log` speichert einen ADIF-Eintrag. Befehle mit `request_id` erhalten eine korrelierte `ft-reply`-Antwort.
 - `{"type":"tx-meters","po":143,"swr":48}` enthält die CI-V-Rohwerte des Po- und SWR-Meters während TX. Fehlende Werte sind `null`. Der Po-Messwert entspricht bei 143 ungefähr 50 W, SWR 48 entspricht 1,5:1.
 - `{"type":"rx-meter","level":120}` enthält im Empfang den CI-V-Rohwert des MAIN-S-Meters (`29 00 15 02`). 0 entspricht S0, 120 entspricht S9 und 241 entspricht S9 +60 dB. Bei fehlender Antwort steht dort `null`.
 - `{"op":"rf_power","percent":25}` setzt den RF-POWER-Sollwert im Bereich 0 bis 100 über CI‑V. `{"type":"rf-power","percent":25,"text":""}` meldet den am IC-7610 gelesenen Wert. Bei fehlendem Rücklesewert steht dort `null`.

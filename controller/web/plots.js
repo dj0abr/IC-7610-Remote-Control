@@ -1,6 +1,6 @@
 const rowCount = 250;
 const averageCount = 8;
-const minimumLevel = -1600;
+export const minimumLevel = -1600;
 const plotBackground = '#0a1520';
 const markerColor = '#a1bdff';
 const palettes = {
@@ -31,6 +31,10 @@ function colorTable(palette, lower, upper) {
     table[i * 4 + 3] = 255;
   }
   return new Uint32Array(table.buffer);
+}
+
+export function waterfallColors(color, lower, upper) {
+  return colorTable(palettes[color], lower, upper);
 }
 
 function box(canvas) {

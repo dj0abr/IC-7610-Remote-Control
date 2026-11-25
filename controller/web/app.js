@@ -1,6 +1,7 @@
 import {BrowserAudio, grantMicrophoneAccess} from '/audio.js';
 import {PlotPair} from '/plots.js';
 import {Microphone} from '/tx-audio.js';
+import {createFtPanel} from '/ft-panel.js';
 
 const element = id => document.getElementById(id);
 const bandSelect = element('band');
@@ -90,6 +91,7 @@ let reconnectDelay = 1000;
 let activeBand = null;
 let bands = [];
 let mainHz = 0;
+let mainConfirmed = false;
 let halfSpan = 30000;
 let spectrumLive = false;
 let setupState = null;
@@ -122,6 +124,13 @@ const microphone = new Microphone(sendMicrophoneFrame, () => {
 });
 const overview = new PlotPair(element('overview'), false, tuneMain, stepMain);
 const zoom = new PlotPair(element('zoom'), true, tuneMain, stepMain);
+const ft = createFtPanel({send, preferences, savePreferences});
+
+function updateFt() {
+  ft.update({connected: socket?.readyState === WebSocket.OPEN, band: activeBand, dial: mainHz,
+    confirmed: mainConfirmed, txReady: tx.ready && tx.phase === 'rx',
+    paused: receivePaused(), voiceBusy: !!pttId, live: spectrumLive});
+}
 
 function savePreferences() {
   try {
@@ -171,10 +180,11 @@ function setMicrophoneError(text) {
 }
 
 function canStartPtt() {
-  return audioEnabled && microphone.ready && tx.ready && tx.phase === 'rx';
+  return audioEnabled && microphone.ready && tx.ready && tx.phase === 'rx' && !ft.busy();
 }
 
 function renderTx() {
+  updateFt();
   renderAudioButton();
   renderRfPower();
   renderRadioOptions();
@@ -356,18 +366,21 @@ function updateTx(message) {
   renderTx();
 }
 
-function setMain(hz) {
+function setMain(hz, confirmed = false) {
   mainHz = Number.isSafeInteger(hz) && hz > 0 ? hz : 0;
+  mainConfirmed = confirmed;
   element('main-frequency').value = mainHz ?
     frequencyFormat.format(mainHz / 1e6).replace(/(\d{3})(\d{3})$/, '$1\u202f$2') : '—';
   overview.setMain(mainHz, halfSpan);
   zoom.setMain(mainHz, halfSpan);
+  updateFt();
 }
 
 function resetPlots() {
   overview.clear();
   zoom.clear();
   spectrumLive = false;
+  updateFt();
 }
 
 function updateThresholds(lower, upper) {
@@ -379,6 +392,7 @@ function updateThresholds(lower, upper) {
   element('upper-value').value = `${String(upper).replace('-', '−')} dBFS`;
   overview.setStyle(lower, upper, color);
   zoom.setStyle(lower, upper, color);
+  ft.setStyle(lower, upper, color);
   return {lower, upper};
 }
 
@@ -427,7 +441,7 @@ function updateRfPower(percent, text = '') {
 function renderRadioOptions() {
   const busy = tx.phase !== 'rx' || !!pttId;
   for (const option of Object.values(radioOptions)) {
-    option.select.disabled = busy || option.value === null;
+    option.select.disabled = busy || option.value === null || (option === radioOptions.compressor && ft.active());
     option.select.value = option.value ?? '';
   }
 }
@@ -447,7 +461,7 @@ function paintFilterRange(control) {
 
 function renderNotch() {
   const mode = rxFilter?.notch_mode ?? 'off';
-  notchModes.disabled = !rxFilter?.notch_mode;
+  notchModes.disabled = !rxFilter?.notch_mode || rxFilter.ft_bypass;
   for (const radio of notchModes.elements) {
     radio.checked = radio.value === mode;
   }
@@ -467,9 +481,10 @@ function renderFilter() {
   renderNotch();
   const sideband = modeSelect.value;
   element('filter-mode').textContent = sideband ? `MAIN · ${sideband}-Filter` : 'MAIN · RX-Filter';
-  for (const control of [filterLower, filterUpper, filterNoise, ...filterPresets]) {
+  for (const control of [filterLower, filterUpper, ...filterPresets]) {
     control.disabled = !rxFilter;
   }
+  filterNoise.disabled = !rxFilter || rxFilter.ft_bypass;
   const zoomLabel = element('zoom-filter');
   zoomLabel.hidden = !rxFilter || !sideband;
   if (!rxFilter) {
@@ -524,8 +539,8 @@ function installFilter(message) {
   if (message.request_id != null && message.request_id !== filterRevision) {
     return;
   }
-  const {low_hz, high_hz, nr_percent, notch_mode, notch_hz, notch_detected_hz} = message;
-  rxFilter = {low_hz, high_hz, nr_percent, notch_mode, notch_hz};
+  const {low_hz, high_hz, nr_percent, notch_mode, notch_hz, notch_detected_hz, ft_bypass} = message;
+  rxFilter = {low_hz, high_hz, nr_percent, notch_mode, notch_hz, ft_bypass: ft_bypass === true};
   detectedNotchHz = notch_detected_hz;
   filterError.textContent = message.text;
   filterError.hidden = !message.text;
@@ -628,6 +643,7 @@ function selectBand(id) {
   zoom.clear();
   restoreBandThresholds(id);
   spectrumLive = false;
+  updateFt();
   const low = rangeFormat.format(band.low_hz / 1e6);
   const high = rangeFormat.format(band.high_hz / 1e6);
   const center = rangeFormat.format(band.center_hz / 1e6);
@@ -877,7 +893,21 @@ function control(message) {
       audio.reset();
       break;
     case 'main':
-      setMain(message.hz);
+      setMain(message.hz, message.confirmed === true);
+      break;
+    case 'ft-state':
+      ft.handle(message);
+      renderRadioOptions();
+      break;
+    case 'ft-reply':
+    case 'ft-tx':
+    case 'ft-decode':
+    case 'ft-error':
+    case 'ft-qso-logged':
+      ft.handle(message);
+      if (message.type === 'ft-tx') {
+        renderTx();
+      }
       break;
     case 'main-status':
       element('main-frequency').title = message.text;
@@ -925,9 +955,15 @@ function binary(data) {
     Int16Array.from({length: count}, (_, bin) => view.getInt16(headerBytes + bin * 2, true));
   if (kind === 1) {
     overview.addFrame(levels, 0);
-    spectrumLive = true;
+    if (!spectrumLive) {
+      spectrumLive = true;
+      updateFt();
+    }
   } else {
-    zoom.addFrame(levels, center);
+    if (!element('zoom').hidden) {
+      zoom.addFrame(levels, center);
+    }
+    ft.addFrame(levels, halfSpan);
   }
 }
 
@@ -939,6 +975,7 @@ function connect() {
   connection.binaryType = 'arraybuffer';
   connection.onopen = () => {
     lastProblem = '';
+    updateFt();
     setStatus('Backend verbinden …', 'connecting');
   };
   connection.onmessage = event => {

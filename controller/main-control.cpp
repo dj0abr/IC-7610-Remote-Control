@@ -1,6 +1,8 @@
 #include "main-control.hpp"
 
+#include <QDateTime>
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <numeric>
 #include <utility>
@@ -10,6 +12,7 @@ using namespace std::chrono_literals;
 namespace
 {
 constexpr auto latchTimeout = 5min;
+constexpr auto digitalLead = 280ms;
 
 struct RadioSettingCommands
 {
@@ -38,12 +41,18 @@ MainControl::MainControl(QObject* parent)
 void MainControl::start(const QString& address, quint64 session)
 {
     stop();
+    if (address != m_address)
+    {
+        m_compressorBeforeFt.reset();
+        m_usbFilterBeforeFt.reset();
+    }
     m_address = address;
     m_session = session;
     m_completedRevision = 0;
     m_clock.start();
     m_nextRead = 0;
     m_nextPttRead = 0;
+    m_nextFtFilterRead = 0;
     m_retryAfter = 0;
     m_timer->start();
     emit statusChanged(m_session, 0, QStringLiteral("MAIN: LAN-CI-V verbinden …"));
@@ -53,12 +62,39 @@ void MainControl::start(const QString& address, quint64 session)
 void MainControl::stop()
 {
     m_timer->stop();
+    m_ftRadioSettingsActive = false;
     if (m_radio)
     {
         m_radio->releasePtt();
+        if (m_compressorBeforeFt)
+        {
+            try
+            {
+                if (!m_radio->transmitting())
+                {
+                    applyFtCompressor();
+                }
+            }
+            catch (const std::exception& error)
+            {
+                qWarning("TX-Kompressor nach FT: %s", error.what());
+            }
+        }
+        if (m_usbFilterBeforeFt)
+        {
+            try
+            {
+                applyFtUsbFilter();
+            }
+            catch (const std::exception& error)
+            {
+                qWarning("MAIN-USB-Filter nach FT: %s", error.what());
+            }
+        }
     }
     m_radio.reset();
     m_requested.reset();
+    m_digitalTx.reset();
     m_radioSettings = {};
     m_micGainDue.reset();
     m_lastFrequency = 0;
@@ -201,6 +237,150 @@ void MainControl::updateTxMeters(Clock::time_point now, std::chrono::millisecond
     m_nextTxMeter = now + 180ms;
 }
 
+void MainControl::scheduleDigitalTx(quint64 session, quint64 id, qint64 dialHz, qint64 audioUtcMs, QByteArray pcm)
+{
+    if (session != m_session || !m_timer->isActive() || m_digitalTx || m_ownedTx || !m_radio)
+    {
+        emit digitalTxChanged(session, id, QStringLiteral("idle"), QStringLiteral("unavailable"), {});
+        return;
+    }
+    const auto untilAudio = std::chrono::milliseconds(audioUtcMs - QDateTime::currentMSecsSinceEpoch());
+    m_digitalTx = DigitalTx{id, dialHz, audioUtcMs, Clock::now() + untilAudio, std::move(pcm)};
+}
+
+void MainControl::finishDigitalTx(const QString& result, const QString& text)
+{
+    const auto id = m_digitalTx->id;
+    if (m_digitalTx->keyed)
+    {
+        finishTx();
+    }
+    m_digitalTx.reset();
+    emit digitalTxChanged(m_session, id, QStringLiteral("idle"), result, text);
+}
+
+bool MainControl::processDigitalTx(Clock::time_point now, bool settingWritePending)
+{
+    if (!m_digitalTx)
+    {
+        return false;
+    }
+    auto& job = *m_digitalTx;
+    const auto cancelled = [this, &job] { return m_cancelDigitalId.load() == job.id; };
+    if (cancelled())
+    {
+        finishDigitalTx(QStringLiteral("stopped"));
+        return true;
+    }
+    const auto utcRemaining = job.audioUtcMs - QDateTime::currentMSecsSinceEpoch();
+    const auto clockRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(job.audioAt - now).count();
+    if (std::llabs(utcRemaining - clockRemaining) > 150)
+    {
+        finishDigitalTx(QStringLiteral("clock_changed"));
+        return true;
+    }
+    if (job.keyed)
+    {
+        if (job.position == job.pcm.size())
+        {
+            if (now >= m_nextAudio + 60ms)
+            {
+                finishDigitalTx(QStringLiteral("complete"));
+            }
+            return true;
+        }
+        if (now >= m_nextAudio)
+        {
+            if (now - m_nextAudio > 75ms)
+            {
+                finishDigitalTx(QStringLiteral("underrun"));
+                return true;
+            }
+            m_radio->sendTxAudio({job.pcm.constData() + job.position, icom::txAudioBytes});
+            job.position += icom::txAudioBytes;
+            m_nextAudio += 20ms;
+        }
+        if (now >= m_nextTxStatus)
+        {
+            if (!m_radio->transmitting())
+            {
+                finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("Der IC-7610 hat TX beendet."));
+            }
+            m_nextTxStatus = now + 1s;
+        }
+        else if (now >= m_nextTxMeter)
+        {
+            const auto meterStart = Clock::now();
+            const auto budget = std::min(icom::txMeterTimeout,
+                std::chrono::floor<std::chrono::milliseconds>(m_nextAudio - meterStart - 2ms));
+            if (budget >= 7ms)
+            {
+                updateTxMeters(meterStart, budget);
+            }
+        }
+        return true;
+    }
+    if (now < job.audioAt - digitalLead)
+    {
+        return false;
+    }
+    if (now >= job.audioAt - 40ms)
+    {
+        finishDigitalTx(QStringLiteral("missed_slot"));
+    }
+    else if (m_ownedTx || m_externalTx || m_requested || settingWritePending || !m_radio->txAudioReady())
+    {
+        finishDigitalTx(QStringLiteral("unavailable"));
+    }
+    else if (static_cast<qint64>(m_radio->mainFrequency()) != job.dialHz)
+    {
+        finishDigitalTx(QStringLiteral("retuned"));
+    }
+    else if (!m_radio->digitalTxMode())
+    {
+        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("Am IC-7610 MAIN auf USB ohne DATA und ohne Split stellen."));
+    }
+    else if (!m_ftRadioSettingsActive || !m_compressorBeforeFt || m_radio->compressor() != 0)
+    {
+        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("TX-Kompressor ist für FT noch nicht ausgeschaltet."));
+    }
+    else if (!m_usbFilterBeforeFt || m_radio->mainIfFilterWidthCode() != icom::maxSsbIfFilterWidthCode ||
+             m_radio->mainTwinPbt() != icom::centeredTwinPbt)
+    {
+        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("MAIN-USB-Filter ist für FT noch nicht auf 3,6 kHz."));
+    }
+    else if (m_radio->transmitting())
+    {
+        finishDigitalTx(QStringLiteral("unavailable"));
+    }
+    else if (cancelled())
+    {
+        finishDigitalTx(QStringLiteral("stopped"));
+    }
+    else if (Clock::now() >= job.audioAt - 35ms)
+    {
+        finishDigitalTx(QStringLiteral("missed_slot"));
+    }
+    else
+    {
+        job.keyed = true;
+        reportTx(QStringLiteral("starting"), true);
+        m_radio->setPtt(true);
+        if (!m_radio->transmitting())
+        {
+            finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("Der IC-7610 hat TX nicht bestätigt."));
+        }
+        else
+        {
+            m_nextAudio = job.audioAt;
+            m_nextTxStatus = job.audioAt + 1s;
+            reportTx(QStringLiteral("tx"), true);
+            emit digitalTxChanged(m_session, job.id, QStringLiteral("sending"), {}, {});
+        }
+    }
+    return true;
+}
+
 bool MainControl::processTx(Clock::time_point now, bool settingWritePending)
 {
     const auto request = currentPtt();
@@ -313,7 +493,8 @@ void MainControl::tune(qint64 lowHz, qint64 highHz, quint64 revision)
 void MainControl::setRadioSetting(quint64 session, int index, int value)
 {
     if (session == m_session && m_radio && m_txPhase == QStringLiteral("rx") &&
-        index >= 0 && index < RadioSettingCount && value >= 0 && value <= radioSettings[index].maximum)
+        index >= 0 && index < RadioSettingCount && value >= 0 && value <= radioSettings[index].maximum &&
+        (index != Compressor || (!m_ftRadioSettingsActive && !m_compressorBeforeFt)))
     {
         auto& setting = m_radioSettings[index];
         if (setting.value >= 0)
@@ -321,6 +502,104 @@ void MainControl::setRadioSetting(quint64 session, int index, int value)
             setting.requested = value;
         }
     }
+}
+
+void MainControl::setFtRadioSettings(quint64 session, bool active)
+{
+    if (session != m_session || active == m_ftRadioSettingsActive)
+    {
+        return;
+    }
+    m_ftRadioSettingsActive = active;
+    m_nextFtFilterRead = 0;
+    auto& setting = m_radioSettings[Compressor];
+    setting.requested.reset();
+    setting.nextRead = 0;
+}
+
+void MainControl::applyFtUsbFilter()
+{
+    const auto preset = m_radio->mainUsbFilterPreset();
+    if (!preset)
+    {
+        return;
+    }
+    if (!m_usbFilterBeforeFt)
+    {
+        m_usbFilterBeforeFt = UsbFilter{*preset, m_radio->mainIfFilterWidthCode(), m_radio->mainTwinPbt()};
+    }
+    const auto [previousPreset, previousWidth, previousPbt] = *m_usbFilterBeforeFt;
+    if (*preset != previousPreset)
+    {
+        if (m_radio->transmitting())
+        {
+            return;
+        }
+        m_radio->setMainUsbFilterPreset(previousPreset);
+        if (m_radio->mainUsbFilterPreset() != previousPreset)
+        {
+            throw std::runtime_error("IC-7610 bestätigt die MAIN-USB-Filterwahl nicht.");
+        }
+    }
+    const int width = m_ftRadioSettingsActive ? icom::maxSsbIfFilterWidthCode : previousWidth;
+    if (m_radio->mainIfFilterWidthCode() != width)
+    {
+        if (m_radio->transmitting())
+        {
+            return;
+        }
+        m_radio->setMainIfFilterWidthCode(width);
+        if (m_radio->mainIfFilterWidthCode() != width)
+        {
+            throw std::runtime_error("IC-7610 bestätigt die MAIN-USB-Filterbreite nicht.");
+        }
+    }
+    // The radio resets both Twin PBT positions when the IF bandwidth changes.
+    const auto& pbt = m_ftRadioSettingsActive ? icom::centeredTwinPbt : previousPbt;
+    if (m_radio->mainTwinPbt() != pbt)
+    {
+        if (m_radio->transmitting())
+        {
+            return;
+        }
+        m_radio->setMainTwinPbt(pbt);
+        if (m_radio->mainTwinPbt() != pbt)
+        {
+            throw std::runtime_error("IC-7610 bestätigt MAIN Twin PBT nicht.");
+        }
+    }
+    if (!m_ftRadioSettingsActive)
+    {
+        m_usbFilterBeforeFt.reset();
+    }
+}
+
+int MainControl::applyFtCompressor()
+{
+    int current = m_radio->compressor();
+    if (!m_compressorBeforeFt)
+    {
+        m_compressorBeforeFt = current;
+    }
+    const int target = m_ftRadioSettingsActive ? 0 : *m_compressorBeforeFt;
+    if (current != target)
+    {
+        if (m_radio->transmitting())
+        {
+            throw std::runtime_error("Der IC-7610 sendet.");
+        }
+        m_radio->setCompressor(target);
+        current = m_radio->compressor();
+        if (current != target)
+        {
+            throw std::runtime_error("IC-7610 bestätigt den TX-Kompressorwert nicht.");
+        }
+    }
+    if (!m_ftRadioSettingsActive)
+    {
+        m_compressorBeforeFt.reset();
+    }
+    return current;
 }
 
 void MainControl::bandChanged(quint64 session)
@@ -359,7 +638,9 @@ void MainControl::updateRadioSettings(qint64 now)
     auto next = std::ranges::find_if(m_radioSettings, [](const auto& setting) { return setting.requested.has_value(); });
     if (next == m_radioSettings.end())
     {
-        next = std::ranges::min_element(m_radioSettings, {}, &SettingState::nextRead);
+        const auto compressor = m_radioSettings.begin() + Compressor;
+        next = (m_ftRadioSettingsActive || m_compressorBeforeFt) && now >= compressor->nextRead
+            ? compressor : std::ranges::min_element(m_radioSettings, {}, &SettingState::nextRead);
         if (now < next->nextRead)
         {
             return;
@@ -386,14 +667,15 @@ void MainControl::updateRadioSettings(qint64 now)
     int value = -1;
     try
     {
-        value = ((*m_radio).*command.read)();
+        value = index == Compressor && (m_ftRadioSettingsActive || m_compressorBeforeFt)
+            ? applyFtCompressor() : ((*m_radio).*command.read)();
     }
     catch (const std::exception&)
     {
         text = QStringLiteral("%1 konnte nicht vom IC-7610 gelesen werden.").arg(label);
     }
     next->nextRead = m_clock.elapsed() + (value >= 0 ? 500 : 1500);
-    if (value != next->value || requested || (value < 0 && text != next->text))
+    if (value != next->value || requested || text != next->text)
     {
         next->value = value;
         next->text = text;
@@ -446,7 +728,9 @@ void MainControl::updateRadio()
         const bool micGainDue = m_micGainDue && now >= *m_micGainDue;
         const bool settingWritePending = micGainDue ||
             std::ranges::any_of(m_radioSettings, [](const auto& setting) { return setting.requested.has_value(); });
-        if (processTx(Clock::now(), settingWritePending))
+        const bool restoringCompressor = !m_ftRadioSettingsActive && m_compressorBeforeFt.has_value();
+        if (processDigitalTx(Clock::now(), settingWritePending) ||
+            processTx(Clock::now(), settingWritePending || restoringCompressor))
         {
             return;
         }
@@ -477,6 +761,19 @@ void MainControl::updateRadio()
         else
         {
             updateRadioSettings(now);
+            if ((m_ftRadioSettingsActive || m_usbFilterBeforeFt) && now >= m_nextFtFilterRead)
+            {
+                try
+                {
+                    applyFtUsbFilter();
+                    m_nextFtFilterRead = m_clock.elapsed() + 500;
+                }
+                catch (const std::exception& error)
+                {
+                    qWarning("MAIN-USB-Filter für FT: %s", error.what());
+                    m_nextFtFilterRead = m_clock.elapsed() + 1500;
+                }
+            }
         }
         if (!m_requested && now < m_nextRead)
         {
@@ -529,7 +826,14 @@ void MainControl::updateRadio()
     }
     catch (const std::exception& error)
     {
-        const bool uncertainTx = m_ownedTx || m_externalTx || m_txPhase == QStringLiteral("unknown");
+        const bool uncertainTx = m_ownedTx || (m_digitalTx && m_digitalTx->keyed) ||
+            m_externalTx || m_txPhase == QStringLiteral("unknown");
+        if (m_digitalTx)
+        {
+            emit digitalTxChanged(m_session, m_digitalTx->id, QStringLiteral("idle"),
+                                  QStringLiteral("unavailable"), QString::fromUtf8(error.what()));
+            m_digitalTx.reset();
+        }
         if (m_ownedTx)
         {
             cancelPtt(m_ownedTx);
@@ -557,6 +861,7 @@ void MainControl::updateRadio()
         m_lastFrequency = 0;
         m_nextRead = 0;
         m_nextPttRead = 0;
+        m_nextFtFilterRead = 0;
         m_retryAfter = m_clock.elapsed() + 1500;
         const quint64 revision = m_requested ? m_requested->revision : m_completedRevision;
         emit statusChanged(m_session, revision, QStringLiteral("MAIN: ") + QString::fromUtf8(error.what()));
