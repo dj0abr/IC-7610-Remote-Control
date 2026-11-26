@@ -6,3 +6,8 @@ __pycache__/
 /controller/kmcontrol-web
 /raspberry/ftdi/
 /raspberry/iq-test
+
+# Geräte- und Logbuchdaten lokaler Installationen
+icom.env
+qrz.env
+ft4-ft8.adi

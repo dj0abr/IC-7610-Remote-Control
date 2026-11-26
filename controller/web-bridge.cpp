@@ -425,9 +425,11 @@ constexpr Asset assets[] = {
 class HttpSession : public std::enable_shared_from_this<HttpSession>
 {
 public:
-    HttpSession(Tcp::socket socket, unsigned short port, unsigned short backendPort)
+    HttpSession(Tcp::socket socket, const Tcp::endpoint& endpoint, unsigned short backendPort)
         : m_stream(std::move(socket)),
-          m_portSuffix(":" + std::to_string(port)),
+          m_portSuffix(endpoint.port() == 80 ? "" : ":" + std::to_string(endpoint.port())),
+          m_bindHost(endpoint.address().to_string() + m_portSuffix),
+          m_allowLocalhost(endpoint.address() == net::ip::address_v4::loopback()),
           m_backendPort(backendPort)
     {
         m_parser.header_limit(8192);
@@ -452,9 +454,9 @@ private:
         m_head = request.method() == http::verb::head;
         m_version = request.version();
         const auto host = std::string(request[http::field::host]);
-        if (host != "127.0.0.1" + m_portSuffix && host != "localhost" + m_portSuffix)
+        if (host != m_bindHost && !(m_allowLocalhost && host == "localhost" + m_portSuffix))
         {
-            respond(http::status::forbidden, "text/plain; charset=utf-8", "Lokaler Host erforderlich.");
+            respond(http::status::forbidden, "text/plain; charset=utf-8", "HTTP-Host ungültig.");
             return;
         }
         if (request.method() != http::verb::get && !m_head)
@@ -509,9 +511,13 @@ private:
         m_response->set(http::field::content_type, mime);
         m_response->set(http::field::cache_control, "no-store");
         m_response->set("X-Content-Type-Options", "nosniff");
-        m_response->set("Content-Security-Policy",
-                        "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
-                        "base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+        auto policy = "default-src 'self'; connect-src 'self' ws://" + m_bindHost;
+        if (m_allowLocalhost)
+        {
+            policy += " ws://localhost" + m_portSuffix;
+        }
+        policy += "; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+        m_response->set("Content-Security-Policy", policy);
         m_response->keep_alive(false);
         m_response->content_length(body.size());
         if (m_head)
@@ -537,7 +543,9 @@ private:
     http::request_parser<http::empty_body> m_parser;
     std::optional<http::response<http::string_body>> m_response;
     std::optional<http::response_serializer<http::string_body>> m_serializer;
-    std::string m_portSuffix;
+    const std::string m_portSuffix;
+    const std::string m_bindHost;
+    const bool m_allowLocalhost;
     unsigned short m_backendPort;
     unsigned int m_version = 11;
     bool m_head = false;
@@ -546,9 +554,9 @@ private:
 class WebServer
 {
 public:
-    WebServer(net::io_context& context, unsigned short port, unsigned short backendPort)
-        : m_acceptor(context, Tcp::endpoint(net::ip::address_v4::loopback(), port)),
-          m_port(port),
+    WebServer(net::io_context& context, const Tcp::endpoint& endpoint, unsigned short backendPort)
+        : m_acceptor(context, endpoint),
+          m_endpoint(endpoint),
           m_backendPort(backendPort)
     {
     }
@@ -563,7 +571,7 @@ private:
     {
         if (!error)
         {
-            std::make_shared<HttpSession>(std::move(socket), m_port, m_backendPort)->start();
+            std::make_shared<HttpSession>(std::move(socket), m_endpoint, m_backendPort)->start();
         }
         if (m_acceptor.is_open())
         {
@@ -572,7 +580,7 @@ private:
     }
 
     Tcp::acceptor m_acceptor;
-    unsigned short m_port;
+    const Tcp::endpoint m_endpoint;
     unsigned short m_backendPort;
 };
 
@@ -607,18 +615,27 @@ int main(int argc, char** argv)
                                   QStringLiteral("Port"), QString::number(defaultPort));
     const QCommandLineOption backendPort(QStringLiteral("backend-port"), QStringLiteral("TCP-Port des Backends"),
                                          QStringLiteral("Port"), QString::number(defaultBackendPort));
+    const QCommandLineOption listen(QStringLiteral("listen"), QStringLiteral("Lokale IPv4-Listenadresse"),
+                                    QStringLiteral("IPv4"), QStringLiteral("127.0.0.1"));
     options.addOption(port);
     options.addOption(backendPort);
+    options.addOption(listen);
     options.process(app);
     try
     {
         const auto webPort = portNumber(options.value(port));
+        ErrorCode addressError;
+        const auto address = net::ip::make_address_v4(options.value(listen).toStdString(), addressError);
+        if (addressError || address.is_unspecified())
+        {
+            throw std::runtime_error("Eine konkrete lokale IPv4-Adresse zum Lauschen angeben.");
+        }
         net::io_context context(1);
         net::signal_set signalSet(context, SIGINT, SIGTERM);
         signalSet.async_wait(beast::bind_front_handler(stopOnSignal, &context));
-        WebServer server(context, webPort, portNumber(options.value(backendPort)));
+        WebServer server(context, Tcp::endpoint(address, webPort), portNumber(options.value(backendPort)));
         server.start();
-        std::cout << "kmcontrol-WebGUI auf http://127.0.0.1:" << webPort << "/\n" << std::flush;
+        std::cout << "kmcontrol-WebGUI auf http://" << address.to_string() << ':' << webPort << "/\n" << std::flush;
         context.run();
     }
     catch (const std::exception& error)

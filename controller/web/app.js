@@ -479,7 +479,7 @@ function renderNotch() {
 
 function renderFilter() {
   renderNotch();
-  const sideband = modeSelect.value;
+  const sideband = rxFilter?.ft_bypass ? 'USB' : modeSelect.value;
   element('filter-mode').textContent = sideband ? `MAIN · ${sideband}-Filter` : 'MAIN · RX-Filter';
   for (const control of [filterLower, filterUpper, ...filterPresets]) {
     control.disabled = !rxFilter;
@@ -877,6 +877,9 @@ function control(message) {
         renderFilter();
       }
       break;
+    case 'main-sideband':
+      modeSelect.title = message.text || `MAIN am IC-7610: ${message.mode}`;
+      break;
     case 'rx-filter':
       installFilter(message);
       break;
@@ -904,6 +907,7 @@ function control(message) {
     case 'ft-decode':
     case 'ft-error':
     case 'ft-qso-logged':
+    case 'ft-qrz-status':
       ft.handle(message);
       if (message.type === 'ft-tx') {
         renderTx();
@@ -998,6 +1002,7 @@ function connect() {
     }
     bandSelect.disabled = true;
     modeSelect.disabled = true;
+    modeSelect.title = '';
     volume.disabled = true;
     activeBand = null;
     setupState = null;

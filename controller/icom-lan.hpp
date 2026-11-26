@@ -21,6 +21,8 @@ inline constexpr int txAudioRate = 16000;
 inline constexpr int txAudioBytes = txAudioRate / 50 * 2;
 inline constexpr auto txMeterTimeout = std::chrono::milliseconds(12);
 
+enum class Sideband : std::uint8_t { Lsb = 0, Usb = 1 };
+
 enum class TxMeter : std::uint8_t { OutputPower = 0x11, Swr = 0x12 };
 
 class CivRejected : public std::runtime_error
@@ -56,6 +58,7 @@ public:
     bool transmitting();
     bool voiceTxMode();
     bool digitalTxMode();
+    int setMainSideband(Sideband sideband);
     std::optional<int> mainUsbFilterPreset();
     void setMainUsbFilterPreset(int preset);
     int mainIfFilterWidthCode();

@@ -34,12 +34,14 @@ public slots:
     void stop();
     void tune(qint64 lowHz, qint64 highHz, quint64 revision);
     void setRadioSetting(quint64 session, int index, int value);
+    void setVoiceSideband(quint64 session, bool usb);
     void setFtRadioSettings(quint64 session, bool active);
     void bandChanged(quint64 session);
 
 signals:
     void frequencyChanged(quint64 session, quint64 revision, qint64 hz);
     void statusChanged(quint64 session, quint64 revision, const QString& text);
+    void sidebandChanged(quint64 session, bool usb, const QString& error);
     void radioSettingChanged(quint64 session, int index, int value, const QString& text);
     void rxMeterChanged(quint64 session, int level);
     void txMetersChanged(quint64 session, int power, int swr);
@@ -69,6 +71,8 @@ private:
     void updateRadioSettings(qint64 now);
     int applyFtCompressor();
     void applyFtUsbFilter();
+    void applyMainMode();
+    void updateMainMode(qint64 now);
     void applyMicGain();
     qint64 writeFrequency(const TuneRequest& request);
     using Clock = std::chrono::steady_clock;
@@ -123,7 +127,9 @@ private:
         std::array<int, 2> twinPbt;
     };
     std::optional<UsbFilter> m_usbFilterBeforeFt;
-    qint64 m_nextFtFilterRead = 0;
+    std::optional<icom::Sideband> m_voiceSideband;
+    bool m_mainModePending = false;
+    qint64 m_nextMainModeRead = 0;
     std::optional<qint64> m_micGainDue;
     quint64 m_session = 0;
     quint64 m_completedRevision = 0;

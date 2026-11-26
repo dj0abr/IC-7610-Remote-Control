@@ -41,7 +41,7 @@ add_library(icom-lan STATIC icom-lan.cpp)
 target_compile_options(icom-lan PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(kmcontrol-backend backend.cpp main-control.cpp spectrum.cpp ssb-demod.cpp
-    rx-audio-filter.cpp rx-notch.cpp ft-receive.cpp ft-transmit.cpp ft_logbook.cpp)
+    rx-audio-filter.cpp rx-notch.cpp ft-receive.cpp ft-transmit.cpp ft_logbook.cpp qrz-logbook.cpp)
 target_link_libraries(kmcontrol-backend PRIVATE Qt5::Core Qt5::Network PkgConfig::FFTW LiquidDSP ${SPEEXDSP_TARGET} icom-lan)
 target_compile_options(kmcontrol-backend PRIVATE -Wall -Wextra -Wpedantic)
 

@@ -4,6 +4,7 @@
 #include "ft-receive.hpp"
 #include "ft-transmit.hpp"
 #include "ft_logbook.hpp"
+#include "qrz-logbook.hpp"
 
 #include <QCoreApplication>
 #include <QCommandLineParser>
@@ -25,8 +26,10 @@
 #include <cmath>
 #include <csignal>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <span>
+#include <utility>
 
 namespace
 {
@@ -143,7 +146,8 @@ QJsonObject describeBand(const Band& band)
 class Backend : public QObject
 {
 public:
-    explicit Backend(const QString& hostOverride)
+    Backend(const QString& hostOverride, const QString& qrzApiKey)
+        : m_qrzLogbook(qrzApiKey)
     {
         m_host = m_settings.value(QStringLiteral("network/pi"), QStringLiteral("192.168.10.140")).toString();
         if (!hostOverride.isEmpty())
@@ -188,6 +192,15 @@ public:
         connect(&m_ftReceiver, &FtReceiver::error, this, [this](const QString& text) {
             send({{QStringLiteral("type"), QStringLiteral("ft-error")}, {QStringLiteral("text"), text}});
         });
+        connect(&m_qrzLogbook, &QrzLogbook::status, this,
+                [this](const QString& call, const QString& state, const QString& text) {
+            if (state == QStringLiteral("error"))
+            {
+                qWarning().noquote() << "QRZ-Logbuch" << call << text;
+            }
+            send({{QStringLiteral("type"), QStringLiteral("ft-qrz-status")},
+                  {QStringLiteral("call"), call}, {QStringLiteral("state"), state}, {QStringLiteral("text"), text}});
+        });
         const auto dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
         if (!dataDir.isEmpty())
         {
@@ -205,6 +218,15 @@ public:
         connect(&m_mainThread, &QThread::finished, m_mainControl, &QObject::deleteLater);
         connect(m_mainControl, &MainControl::frequencyChanged, this, &Backend::updateMainFrequency);
         connect(m_mainControl, &MainControl::statusChanged, this, &Backend::updateMainStatus);
+        connect(m_mainControl, &MainControl::sidebandChanged, this,
+                [this](quint64 session, bool usb, const QString& error) {
+            if (m_gui && session == m_mainSession)
+            {
+                send({{QStringLiteral("type"), QStringLiteral("main-sideband")},
+                      {QStringLiteral("mode"), usb ? QStringLiteral("USB") : QStringLiteral("LSB")},
+                      {QStringLiteral("text"), error}});
+            }
+        });
         connect(m_mainControl, &MainControl::radioSettingChanged, this, &Backend::updateRadioSetting);
         connect(m_mainControl, &MainControl::rxMeterChanged, this, &Backend::updateRxMeter);
         connect(m_mainControl, &MainControl::txMetersChanged, this, &Backend::updateTxMeters);
@@ -224,6 +246,8 @@ public:
         }
         disconnect(&m_pi, nullptr, this, nullptr);
         m_pi.abort();
+        m_spectrumThread.quit();
+        m_spectrumThread.wait();
         QMetaObject::invokeMethod(m_mainControl, "stop", Qt::BlockingQueuedConnection);
         m_mainThread.quit();
         m_mainThread.wait();
@@ -231,7 +255,8 @@ public:
 
     bool start()
     {
-        if (!m_fft.ready())
+        auto spectrum = std::make_unique<Spectrum>();
+        if (!spectrum->ready())
         {
             qCritical("FFT konnte nicht initialisiert werden.");
             return false;
@@ -246,7 +271,16 @@ public:
             qCritical().noquote() << m_server.errorString();
             return false;
         }
+        m_spectrum = spectrum.release();
+        m_spectrum->moveToThread(&m_spectrumThread);
+        connect(&m_spectrumThread, &QThread::finished, m_spectrum, &QObject::deleteLater);
+        m_spectrumThread.setObjectName(QStringLiteral("kmcontrol-fft"));
+        m_spectrumThread.start();
         qInfo("Web-Bridge-Schnittstelle auf 127.0.0.1:50020");
+        if (m_qrzLogbook.enabled() && m_ftLogbook)
+        {
+            qInfo("Automatischer QRZ-Logbuch-Upload aktiv.");
+        }
         return true;
     }
 
@@ -425,6 +459,7 @@ private:
             }
             m_desired = band;
             m_sideband = parseSideband(m_settings.value(sidebandKey(band)).toString(), m_defaultSideband);
+            setRadioSideband();
             send({{QStringLiteral("type"), QStringLiteral("sideband")},
                   {QStringLiteral("band"), band->id},
                   {QStringLiteral("mode"), sidebandMode(m_sideband)}});
@@ -537,8 +572,18 @@ private:
         if (m_sideband != sideband)
         {
             m_sideband = sideband;
-            updateDemodulator();
+            if (!m_ftMode)
+            {
+                updateDemodulator();
+            }
         }
+        setRadioSideband();
+    }
+
+    void setRadioSideband()
+    {
+        QMetaObject::invokeMethod(m_mainControl, "setVoiceSideband", Qt::QueuedConnection,
+                                  Q_ARG(quint64, m_mainSession), Q_ARG(bool, m_sideband == Sideband::Usb));
     }
 
     int detectedNotchHz() const
@@ -723,7 +768,7 @@ private:
                 }
             }
             m_ftReceiver.select(m_ftMode, m_mainHz);
-            updateDemodulator(false);
+            updateDemodulator(bypassChanged);
         }
         sendFtState();
         ftReply(request, true);
@@ -784,19 +829,25 @@ private:
             ftReply(request, false, QStringLiteral("ft_log_invalid"), QStringLiteral("Ungültige QSO-Daten."));
             return;
         }
+        std::optional<std::string> adif;
         try
         {
-            m_ftLogbook->save({call.toStdString(), own.toStdString(), grid.toStdString(), ownGrid.toStdString(),
+            adif = m_ftLogbook->save({call.toStdString(), own.toStdString(), grid.toStdString(), ownGrid.toStdString(),
                 mode.toStdString(), sent.toStdString(), received.toStdString(), band->id.section('-', 0, 0).toStdString(),
                 static_cast<std::time_t>(start), static_cast<std::time_t>(end),
                 static_cast<std::uint64_t>(txHz), static_cast<std::uint64_t>(rxHz)});
-            ftReply(request, true);
-            send({{QStringLiteral("type"), QStringLiteral("ft-qso-logged")}, {QStringLiteral("call"), call}});
         }
         catch (const std::exception& error)
         {
             qWarning("FT-Logbuch: %s", error.what());
             ftReply(request, false, QStringLiteral("ft_log_error"));
+            return;
+        }
+        ftReply(request, true);
+        send({{QStringLiteral("type"), QStringLiteral("ft-qso-logged")}, {QStringLiteral("call"), call}});
+        if (adif && m_qrzLogbook.enabled())
+        {
+            m_qrzLogbook.insert(call, own, QByteArray::fromStdString(*adif));
         }
     }
 
@@ -908,6 +959,10 @@ private:
         QMetaObject::invokeMethod(m_mainControl, "start", Qt::QueuedConnection,
                                   Q_ARG(QString, m_radioAddress),
                                   Q_ARG(quint64, m_mainSession));
+        if (m_desired)
+        {
+            setRadioSideband();
+        }
         if (m_ftMode)
         {
             setRadioSettingsForFt();
@@ -1054,7 +1109,7 @@ private:
               {QStringLiteral("text"), text}});
         if (changed)
         {
-            m_samples.clear();
+            resetSpectrum();
             updateDemodulator();
             if (paused)
             {
@@ -1128,7 +1183,8 @@ private:
         {
             if (reset || (!m_demodulating && !m_ftDemodulating))
             {
-                m_demodulator.tune(static_cast<int>(offset), m_sideband);
+                const auto sideband = m_ftMode ? Sideband::Usb : m_sideband;
+                m_demodulator.tune(static_cast<int>(offset), sideband);
             }
             else
             {
@@ -1234,7 +1290,7 @@ private:
             cancelFtTx();
         }
         m_data.clear();
-        m_samples.clear();
+        resetSpectrum();
         m_index = 0;
         m_header = false;
         m_active = nullptr;
@@ -1306,7 +1362,7 @@ private:
         }
         m_pending = m_desired;
         m_active = nullptr;
-        m_samples.clear();
+        resetSpectrum();
         updateDemodulator();
         state(QStringLiteral("tuning"), QStringLiteral("SUB wird eingestellt …"), m_pending);
         m_deadline.start();
@@ -1315,7 +1371,7 @@ private:
 
     void activate()
     {
-        m_samples.clear();
+        resetSpectrum();
         m_samples.reserve(Spectrum::bytes);
         m_active = m_desired;
         updateDemodulator();
@@ -1443,22 +1499,37 @@ private:
         }
     }
 
-    void sendSpectrum()
+    void resetSpectrum()
     {
-        m_fft.transform(m_samples);
-        send({{QStringLiteral("type"), QStringLiteral("spectrum")},
-              {QStringLiteral("band"), m_active->id},
-              {QStringLiteral("levels_db10"), m_fft.wideLevels(*m_active, m_center, m_rate)}});
+        m_samples.clear();
+        ++m_spectrumGeneration;
+    }
 
-        const qint64 offset = m_mainHz - m_center;
-        if (m_mainHz > 0 && std::abs(offset) <= Spectrum::usableHalfWidthHz + zoomHalfSpanHz)
+    void queueSpectrum()
+    {
+        // Keep at most one frame in flight so slow consumers cannot delay live spectra.
+        if (m_spectrumBusy || !m_gui || m_gui->bytesToWrite() > streamQueueLimit)
         {
-            send({{QStringLiteral("type"), QStringLiteral("zoom-spectrum")},
-                  {QStringLiteral("band"), m_active->id},
-                  {QStringLiteral("center_hz"), static_cast<double>(m_mainHz)},
-                  {QStringLiteral("levels_db10"),
-                   m_fft.zoomLevels(static_cast<int>(offset), zoomHalfSpanHz, m_rate)}});
+            return;
         }
+        m_spectrumBusy = true;
+        QMetaObject::invokeMethod(m_spectrum, [this, spectrum = m_spectrum, samples = m_samples,
+                                             band = m_active, center = m_center, rate = m_rate,
+                                             mainHz = m_mainHz, generation = m_spectrumGeneration] {
+            auto frames = spectrum->render(samples, *band, center, rate, mainHz, zoomHalfSpanHz);
+            QMetaObject::invokeMethod(this, [this, frames = std::move(frames), generation, mainHz] {
+                m_spectrumBusy = false;
+                if (generation != m_spectrumGeneration || !m_gui || m_gui->bytesToWrite() > streamQueueLimit)
+                {
+                    return;
+                }
+                m_gui->write(frames.wide);
+                if (mainHz == m_mainHz && !frames.zoom.isEmpty())
+                {
+                    m_gui->write(frames.zoom);
+                }
+            }, Qt::QueuedConnection);
+        }, Qt::QueuedConnection);
     }
 
     void samples(const char* data, int length)
@@ -1470,7 +1541,7 @@ private:
         // The IC-7610 supplies zeroed I/Q during TX, including before the CI-V status arrives.
         if (std::all_of(data, data + length, [](char byte) { return byte == 0; }))
         {
-            m_samples.clear();
+            resetSpectrum();
             m_ftReceiver.breakStream();
             m_demodulator.clearNotchDetection();
             publishNotchFrequency();
@@ -1497,10 +1568,7 @@ private:
             length -= count;
             if (m_samples.size() == Spectrum::bytes)
             {
-                if (m_gui->bytesToWrite() <= streamQueueLimit)
-                {
-                    sendSpectrum();
-                }
+                queueSpectrum();
                 m_samples.remove(0, hopBytes);
             }
         }
@@ -1518,6 +1586,7 @@ private:
     std::optional<FtMode> m_ftMode;
     std::optional<FtJob> m_ftJob;
     std::unique_ptr<bridge::FtLogbook> m_ftLogbook;
+    QrzLogbook m_qrzLogbook;
     FtReceiver m_ftReceiver;
     quint64 m_nextFtId = 0;
     QString m_host;
@@ -1541,7 +1610,10 @@ private:
     QTcpSocket m_pi;
     QTimer m_retry;
     QTimer m_deadline;
-    Spectrum m_fft;
+    QThread m_spectrumThread;
+    Spectrum* m_spectrum = nullptr;
+    quint64 m_spectrumGeneration = 0;
+    bool m_spectrumBusy = false;
     const Band* m_desired = nullptr;
     const Band* m_pending = nullptr;
     const Band* m_active = nullptr;
@@ -1573,10 +1645,14 @@ int main(int argc, char** argv)
     parser.addHelpOption();
     const QCommandLineOption pi(QStringLiteral("pi"), QStringLiteral("Adresse des Pi"),
                                 QStringLiteral("Host"));
+    const QCommandLineOption qrzApiKey(QStringLiteral("qrz-api-key"),
+                                       QStringLiteral("API-Key für den automatischen QRZ-Logbuch-Upload"),
+                                       QStringLiteral("KEY"));
     parser.addOption(pi);
+    parser.addOption(qrzApiKey);
     parser.process(app);
 
-    Backend backend(parser.value(pi));
+    Backend backend(parser.value(pi), parser.value(qrzApiKey));
     if (!backend.start())
     {
         return 1;

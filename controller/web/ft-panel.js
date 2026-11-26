@@ -743,6 +743,10 @@ export function createFtPanel({send, preferences, savePreferences}) {
       for (const {line} of ft8Log.lines) {
         if (line.dataset.cqCall === message.call) line.removeAttribute('data-new-cq');
       }
+    } else if (message.type === 'ft-qrz-status') {
+      const status = $('ft-qrz-status');
+      status.textContent = `${message.call} · ${message.text}`;
+      status.classList.toggle('setting-error', message.state === 'error');
     } else if (message.type === 'ft-error' && active) {
       ft8Error = message.text;
     }

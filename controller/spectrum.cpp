@@ -1,5 +1,7 @@
 #include "spectrum.hpp"
 
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QString>
 #include <QtEndian>
 #include <algorithm>
@@ -8,6 +10,13 @@
 
 namespace
 {
+QByteArray spectrumLine(const QJsonObject& object)
+{
+    QByteArray line = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    return line;
+}
+
 Band makeBand(const QString& id, const QString& label, int low, int high, int center = 0)
 {
     const int margin = std::clamp((high - low) / 20, 5000, 25000);
@@ -78,6 +87,25 @@ Spectrum::~Spectrum()
 bool Spectrum::ready() const
 {
     return m_plan != nullptr;
+}
+
+Spectrum::Frames Spectrum::render(const QByteArray& samples, const Band& band, int centerHz, int sampleRate,
+                                  qint64 mainHz, int zoomHalfSpanHz)
+{
+    transform(samples);
+    Frames frames;
+    frames.wide = spectrumLine({{QStringLiteral("type"), QStringLiteral("spectrum")},
+                                {QStringLiteral("band"), band.id},
+                                {QStringLiteral("levels_db10"), wideLevels(band, centerHz, sampleRate)}});
+    const qint64 offset = mainHz - centerHz;
+    if (mainHz > 0 && std::abs(offset) <= usableHalfWidthHz + zoomHalfSpanHz)
+    {
+        frames.zoom = spectrumLine({{QStringLiteral("type"), QStringLiteral("zoom-spectrum")},
+                                    {QStringLiteral("band"), band.id},
+                                    {QStringLiteral("center_hz"), static_cast<double>(mainHz)},
+                                    {QStringLiteral("levels_db10"), zoomLevels(static_cast<int>(offset), zoomHalfSpanHz, sampleRate)}});
+    }
+    return frames;
 }
 
 float Spectrum::power(int bin) const

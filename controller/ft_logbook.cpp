@@ -102,9 +102,9 @@ bool FtLogbook::worked_recently(const std::string& call, std::time_t now) const 
     return entry != latest_.end() && entry->second <= now && now - entry->second <= 3 * 24 * 60 * 60;
 }
 
-void FtLogbook::save(const FtQsoRecord& qso) {
+std::optional<std::string> FtLogbook::save(const FtQsoRecord& qso) {
     const auto key = Key(qso.call, qso.own_call, qso.mode, qso.start);
-    if (records_.count(key)) return;
+    if (records_.count(key)) return std::nullopt;
 
     const auto record = field("CALL", qso.call) + field("STATION_CALLSIGN", qso.own_call) +
         field("QSO_DATE", utc(qso.start, "%Y%m%d")) + field("TIME_ON", utc(qso.start, "%H%M%S")) +
@@ -143,5 +143,6 @@ void FtLogbook::save(const FtQsoRecord& qso) {
     records_.insert(key);
     auto& latest = latest_[qso.call];
     latest = std::max(latest, qso.end);
+    return record;
 }
 }

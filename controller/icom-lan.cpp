@@ -753,14 +753,40 @@ public:
         return split.size() == 1 && split[0] == 0 && mainUsbFilterPreset().has_value();
     }
 
-    std::optional<int> mainUsbFilterPreset()
+    std::array<Byte, 3> readMainMode()
     {
         const auto main = exchangeCiv(std::array<Byte, 2>{0x26, 0x00}, false, 1, 120ms);
         if (main.size() != 3 || main[2] < 1 || main[2] > 3)
         {
-            throw std::runtime_error("Ungültige MAIN-Filtereinstellung vom IC-7610.");
+            throw std::runtime_error("Ungültige MAIN-Betriebsart vom IC-7610.");
         }
-        return main[0] == 1 && main[1] == 0 ? std::optional<int>(main[2]) : std::nullopt;
+        return {main[0], main[1], main[2]};
+    }
+
+    int setMainSideband(Sideband sideband)
+    {
+        auto main = readMainMode();
+        const auto target = static_cast<Byte>(sideband);
+        if (main[0] != target || main[1] != 0)
+        {
+            if (transmitting())
+            {
+                throw std::runtime_error("Der IC-7610 sendet.");
+            }
+            exchangeCiv(std::array<Byte, 5>{0x26, 0x00, target, 0x00, main[2]}, true, 1, 160ms, false);
+            main = readMainMode();
+            if (main[0] != target || main[1] != 0)
+            {
+                throw std::runtime_error("IC-7610 bestätigt das MAIN-Seitenband nicht.");
+            }
+        }
+        return main[2];
+    }
+
+    std::optional<int> mainUsbFilterPreset()
+    {
+        const auto [mode, data, preset] = readMainMode();
+        return mode == static_cast<Byte>(Sideband::Usb) && data == 0 ? std::optional<int>(preset) : std::nullopt;
     }
 
     void setMainUsbFilterPreset(int preset)
@@ -1162,6 +1188,7 @@ bool LanRadio::txAudioReady() const { return m_impl->radio.txAudioReady(); }
 bool LanRadio::transmitting() { return m_impl->radio.transmitting(); }
 bool LanRadio::voiceTxMode() { return m_impl->radio.voiceTxMode(); }
 bool LanRadio::digitalTxMode() { return m_impl->radio.digitalTxMode(); }
+int LanRadio::setMainSideband(Sideband sideband) { return m_impl->radio.setMainSideband(sideband); }
 std::optional<int> LanRadio::mainUsbFilterPreset() { return m_impl->radio.mainUsbFilterPreset(); }
 void LanRadio::setMainUsbFilterPreset(int preset) { m_impl->radio.setMainUsbFilterPreset(preset); }
 int LanRadio::mainIfFilterWidthCode() { return m_impl->radio.mainIfFilterWidthCode(); }

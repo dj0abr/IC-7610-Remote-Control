@@ -52,7 +52,7 @@ void MainControl::start(const QString& address, quint64 session)
     m_clock.start();
     m_nextRead = 0;
     m_nextPttRead = 0;
-    m_nextFtFilterRead = 0;
+    m_nextMainModeRead = 0;
     m_retryAfter = 0;
     m_timer->start();
     emit statusChanged(m_session, 0, QStringLiteral("MAIN: LAN-CI-V verbinden …"));
@@ -62,6 +62,7 @@ void MainControl::start(const QString& address, quint64 session)
 void MainControl::stop()
 {
     m_timer->stop();
+    const bool restoreVoiceMode = m_ftRadioSettingsActive || m_usbFilterBeforeFt.has_value();
     m_ftRadioSettingsActive = false;
     if (m_radio)
     {
@@ -80,15 +81,18 @@ void MainControl::stop()
                 qWarning("TX-Kompressor nach FT: %s", error.what());
             }
         }
-        if (m_usbFilterBeforeFt)
+        if (restoreVoiceMode)
         {
             try
             {
-                applyFtUsbFilter();
+                if (!m_radio->transmitting())
+                {
+                    applyMainMode();
+                }
             }
             catch (const std::exception& error)
             {
-                qWarning("MAIN-USB-Filter nach FT: %s", error.what());
+                qWarning("MAIN-Betriebsart nach FT: %s", error.what());
             }
         }
     }
@@ -96,6 +100,8 @@ void MainControl::stop()
     m_requested.reset();
     m_digitalTx.reset();
     m_radioSettings = {};
+    m_voiceSideband.reset();
+    m_mainModePending = false;
     m_micGainDue.reset();
     m_lastFrequency = 0;
     m_ownedTx = 0;
@@ -338,7 +344,7 @@ bool MainControl::processDigitalTx(Clock::time_point now, bool settingWritePendi
     }
     else if (!m_radio->digitalTxMode())
     {
-        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("Am IC-7610 MAIN auf USB ohne DATA und ohne Split stellen."));
+        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("FT-TX erfordert MAIN in USB ohne DATA und ausgeschaltetes Split."));
     }
     else if (!m_ftRadioSettingsActive || !m_compressorBeforeFt || m_radio->compressor() != 0)
     {
@@ -504,6 +510,19 @@ void MainControl::setRadioSetting(quint64 session, int index, int value)
     }
 }
 
+void MainControl::setVoiceSideband(quint64 session, bool usb)
+{
+    if (session == m_session)
+    {
+        m_voiceSideband = usb ? icom::Sideband::Usb : icom::Sideband::Lsb;
+        if (!m_ftRadioSettingsActive)
+        {
+            m_mainModePending = true;
+        }
+        m_nextMainModeRead = 0;
+    }
+}
+
 void MainControl::setFtRadioSettings(quint64 session, bool active)
 {
     if (session != m_session || active == m_ftRadioSettingsActive)
@@ -511,7 +530,8 @@ void MainControl::setFtRadioSettings(quint64 session, bool active)
         return;
     }
     m_ftRadioSettingsActive = active;
-    m_nextFtFilterRead = 0;
+    m_mainModePending = true;
+    m_nextMainModeRead = 0;
     auto& setting = m_radioSettings[Compressor];
     setting.requested.reset();
     setting.nextRead = 0;
@@ -519,17 +539,13 @@ void MainControl::setFtRadioSettings(quint64 session, bool active)
 
 void MainControl::applyFtUsbFilter()
 {
-    const auto preset = m_radio->mainUsbFilterPreset();
-    if (!preset)
-    {
-        return;
-    }
+    const int preset = m_radio->setMainSideband(icom::Sideband::Usb);
     if (!m_usbFilterBeforeFt)
     {
-        m_usbFilterBeforeFt = UsbFilter{*preset, m_radio->mainIfFilterWidthCode(), m_radio->mainTwinPbt()};
+        m_usbFilterBeforeFt = UsbFilter{preset, m_radio->mainIfFilterWidthCode(), m_radio->mainTwinPbt()};
     }
     const auto [previousPreset, previousWidth, previousPbt] = *m_usbFilterBeforeFt;
-    if (*preset != previousPreset)
+    if (preset != previousPreset)
     {
         if (m_radio->transmitting())
         {
@@ -571,6 +587,44 @@ void MainControl::applyFtUsbFilter()
     if (!m_ftRadioSettingsActive)
     {
         m_usbFilterBeforeFt.reset();
+    }
+}
+
+void MainControl::applyMainMode()
+{
+    if (m_ftRadioSettingsActive || m_usbFilterBeforeFt)
+    {
+        applyFtUsbFilter();
+    }
+    if (!m_ftRadioSettingsActive && !m_usbFilterBeforeFt && m_voiceSideband)
+    {
+        m_radio->setMainSideband(*m_voiceSideband);
+    }
+}
+
+void MainControl::updateMainMode(qint64 now)
+{
+    if (now < m_nextMainModeRead || (!m_mainModePending && !m_ftRadioSettingsActive && !m_usbFilterBeforeFt))
+    {
+        return;
+    }
+    const bool usb = m_ftRadioSettingsActive || m_voiceSideband == icom::Sideband::Usb;
+    try
+    {
+        const bool checkRequested = m_mainModePending || m_nextMainModeRead == 0;
+        applyMainMode();
+        m_mainModePending = false;
+        m_nextMainModeRead = m_clock.elapsed() + 500;
+        if (checkRequested && (m_ftRadioSettingsActive || (m_voiceSideband && !m_usbFilterBeforeFt)))
+        {
+            emit sidebandChanged(m_session, usb, {});
+        }
+    }
+    catch (const std::exception& error)
+    {
+        m_mainModePending = true;
+        m_nextMainModeRead = m_clock.elapsed() + 1500;
+        emit sidebandChanged(m_session, usb, QString::fromUtf8(error.what()));
     }
 }
 
@@ -722,15 +776,16 @@ void MainControl::updateRadio()
             radio->connectDefault(icom::defaultControlPort, true);
             m_radio = std::move(radio);
             m_micGainDue = 0;
+            m_mainModePending = m_voiceSideband || m_ftRadioSettingsActive || m_usbFilterBeforeFt;
         }
 
         m_radio->service();
         const bool micGainDue = m_micGainDue && now >= *m_micGainDue;
-        const bool settingWritePending = micGainDue ||
+        const bool settingWritePending = micGainDue || m_mainModePending ||
             std::ranges::any_of(m_radioSettings, [](const auto& setting) { return setting.requested.has_value(); });
-        const bool restoringCompressor = !m_ftRadioSettingsActive && m_compressorBeforeFt.has_value();
+        const bool restoringVoiceSettings = !m_ftRadioSettingsActive && (m_compressorBeforeFt || m_usbFilterBeforeFt);
         if (processDigitalTx(Clock::now(), settingWritePending) ||
-            processTx(Clock::now(), settingWritePending || restoringCompressor))
+            processTx(Clock::now(), settingWritePending || restoringVoiceSettings))
         {
             return;
         }
@@ -761,67 +816,63 @@ void MainControl::updateRadio()
         else
         {
             updateRadioSettings(now);
-            if ((m_ftRadioSettingsActive || m_usbFilterBeforeFt) && now >= m_nextFtFilterRead)
+        }
+        const bool frequencyDue = m_requested || now >= m_nextRead;
+        if (frequencyDue)
+        {
+            const auto requested = m_requested;
+            qint64 frequency = 0;
+            if (requested)
             {
-                try
+                frequency = writeFrequency(*requested);
+                m_completedRevision = requested->revision;
+                m_requested.reset();
+                // A frequency change across bands can select another mode on the radio.
+                if (m_ftRadioSettingsActive || (m_voiceSideband && requested->lowHz != requested->highHz))
                 {
-                    applyFtUsbFilter();
-                    m_nextFtFilterRead = m_clock.elapsed() + 500;
+                    m_mainModePending = true;
+                    m_nextMainModeRead = 0;
                 }
-                catch (const std::exception& error)
+                if (frequency == 0)
                 {
-                    qWarning("MAIN-USB-Filter für FT: %s", error.what());
-                    m_nextFtFilterRead = m_clock.elapsed() + 1500;
+                    // Read the actual setting again after an explicit rejection.
+                    m_lastFrequency = 0;
+                    m_nextRead = 0;
+                    return;
                 }
             }
-        }
-        if (!m_requested && now < m_nextRead)
-        {
-            if (!settingWritePending && now >= m_nextRxMeter)
+            else
             {
-                const auto level = m_radio->readMainSMeter();
-                m_nextRxMeter = m_clock.elapsed() + 150;
-                emit rxMeterChanged(m_session, level.value_or(-1));
+                frequency = static_cast<qint64>(m_radio->mainFrequency());
             }
-            return;
-        }
 
-        const auto requested = m_requested;
-        qint64 frequency = 0;
-        if (requested)
-        {
-            frequency = writeFrequency(*requested);
-            m_completedRevision = requested->revision;
-            m_requested.reset();
-            if (frequency == 0)
+            m_nextRead = m_clock.elapsed() + 300;
+            if (frequency != m_lastFrequency || requested)
             {
-                // Read the actual setting again after an explicit rejection.
-                m_lastFrequency = 0;
-                m_nextRead = 0;
-                return;
+                m_lastFrequency = frequency;
+                emit frequencyChanged(m_session, m_completedRevision, frequency);
+            }
+            if (requested)
+            {
+                const QString status = requested->matches(frequency)
+                    ? QStringLiteral("MAIN-Frequenz am IC-7610 bestätigt")
+                    : QStringLiteral("IC-7610 meldet abweichende MAIN-Frequenz");
+                emit statusChanged(m_session, m_completedRevision, status);
+            }
+            else if (newSession)
+            {
+                emit statusChanged(m_session, m_completedRevision, QStringLiteral("MAIN über LAN-CI-V verbunden"));
             }
         }
-        else
+        if (!micGainDue)
         {
-            frequency = static_cast<qint64>(m_radio->mainFrequency());
+            updateMainMode(now);
         }
-
-        m_nextRead = m_clock.elapsed() + 300;
-        if (frequency != m_lastFrequency || requested)
+        if (!frequencyDue && !settingWritePending && now >= m_nextRxMeter)
         {
-            m_lastFrequency = frequency;
-            emit frequencyChanged(m_session, m_completedRevision, frequency);
-        }
-        if (requested)
-        {
-            const QString status = requested->matches(frequency)
-                ? QStringLiteral("MAIN-Frequenz am IC-7610 bestätigt")
-                : QStringLiteral("IC-7610 meldet abweichende MAIN-Frequenz");
-            emit statusChanged(m_session, m_completedRevision, status);
-        }
-        else if (newSession)
-        {
-            emit statusChanged(m_session, m_completedRevision, QStringLiteral("MAIN über LAN-CI-V verbunden"));
+            const auto level = m_radio->readMainSMeter();
+            m_nextRxMeter = m_clock.elapsed() + 150;
+            emit rxMeterChanged(m_session, level.value_or(-1));
         }
     }
     catch (const std::exception& error)
@@ -861,7 +912,7 @@ void MainControl::updateRadio()
         m_lastFrequency = 0;
         m_nextRead = 0;
         m_nextPttRead = 0;
-        m_nextFtFilterRead = 0;
+        m_nextMainModeRead = 0;
         m_retryAfter = m_clock.elapsed() + 1500;
         const quint64 revision = m_requested ? m_requested->revision : m_completedRevision;
         emit statusChanged(m_session, revision, QStringLiteral("MAIN: ") + QString::fromUtf8(error.what()));

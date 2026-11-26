@@ -3,6 +3,7 @@
 #include <ctime>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -18,7 +19,7 @@ class FtLogbook {
 public:
     explicit FtLogbook(std::filesystem::path path);
     bool worked_recently(const std::string& call, std::time_t now) const;
-    void save(const FtQsoRecord& qso);
+    std::optional<std::string> save(const FtQsoRecord& qso);
 
 private:
     using Key = std::tuple<std::string, std::string, std::string, std::time_t>;

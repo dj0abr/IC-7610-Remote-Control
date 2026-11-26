@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QJsonArray>
+#include <QObject>
 #include <QString>
 #include <fftw3.h>
 #include <vector>
@@ -19,7 +20,7 @@ struct Band
 
 const std::vector<Band>& bands();
 
-class Spectrum
+class Spectrum : public QObject
 {
 public:
     static constexpr int size = 131072;
@@ -27,16 +28,24 @@ public:
     static constexpr int usableHalfWidthHz = 830000;
 
     Spectrum();
-    ~Spectrum();
+    ~Spectrum() override;
     Spectrum(const Spectrum&) = delete;
     Spectrum& operator=(const Spectrum&) = delete;
 
+    struct Frames
+    {
+        QByteArray wide;
+        QByteArray zoom;
+    };
+
     bool ready() const;
+    Frames render(const QByteArray& samples, const Band& band, int centerHz, int sampleRate,
+                  qint64 mainHz, int zoomHalfSpanHz);
+
+private:
     void transform(const QByteArray& samples);
     QJsonArray wideLevels(const Band& band, int centerHz, int sampleRate) const;
     QJsonArray zoomLevels(int offsetHz, int halfSpanHz, int sampleRate) const;
-
-private:
     float power(int bin) const;
     int level(float power) const;
 
