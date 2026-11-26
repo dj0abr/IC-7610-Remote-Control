@@ -56,13 +56,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
   }
   for (const log of [ft8Log, ftOwnLog]) {
     const {output} = log;
-    const resize = new ResizeObserver(([entry]) => {
-      // Keep layout selection independent of whether the log has a scrollbar.
-      const width = entry.borderBoxSize[0].inlineSize;
-      const layout = width < 510 ? 'stacked' : width < 670 ? 'compact' : 'wide';
-      if (output.dataset.ftLayout !== layout) output.dataset.ftLayout = layout;
-      scheduleFtLogScroll(log);
-    });
+    const resize = new ResizeObserver(() => scheduleFtLogScroll(log));
     resize.observe(output, {box: 'border-box'});
     output.addEventListener('scroll', () => {
       if (!log.height || log.height !== output.clientHeight || log.width !== output.clientWidth ||
