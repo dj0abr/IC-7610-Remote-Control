@@ -185,7 +185,7 @@ static double seconds(void)
 }
 
 enum { TCP_PORT = 50010, SAMPLE_RATE = 1920000, SEND_TIMEOUT_MS = 250 };
-static const char pi_address[] = "192.168.10.140";
+static const char default_pi_address[] = "192.168.10.140";
 
 static void write_be(uint8_t *output, size_t n, uint64_t value)
 {
@@ -618,7 +618,7 @@ cleanup:
     return restored ? (passed ? 0 : 1) : 2;
 }
 
-static int serve(uint64_t target_hz)
+static int serve(uint64_t target_hz, const char *pi_address)
 {
     const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (listener < 0) {
@@ -691,12 +691,15 @@ int main(int argc, char **argv)
 {
     const int probe = argc == 2 && strcmp(argv[1], "--probe") == 0;
     const int server = argc > 1 && strcmp(argv[1], "--serve") == 0;
+    const char *pi_address = default_pi_address;
     uint64_t target_hz = server ? 28150000 : 18118000;
     int capture_snapshot = 0;
     if (!probe) {
         for (int i = server ? 2 : 1; i < argc; ++i) {
             if (!server && strcmp(argv[i], "--snapshot") == 0) {
                 capture_snapshot = 1;
+            } else if (server && strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+                pi_address = argv[++i];
             } else if (strcmp(argv[i], "--sub-hz") == 0 && i + 1 < argc) {
                 const char *value = argv[++i];
                 char *end;
@@ -707,7 +710,7 @@ int main(int argc, char **argv)
                     return 2;
                 }
             } else {
-                fprintf(stderr, "Aufruf: %s [--probe | --serve [--sub-hz Hz] | "
+                fprintf(stderr, "Aufruf: %s [--probe | --serve [--listen IPv4] [--sub-hz Hz] | "
                         "[--sub-hz Hz] [--snapshot]]\n", argv[0]);
                 return 2;
             }
@@ -718,5 +721,5 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &handler, NULL);
     sigaction(SIGTERM, &handler, NULL);
     setvbuf(stdout, NULL, _IOLBF, 0);
-    return server ? serve(target_hz) : radio_session(probe, target_hz, capture_snapshot, -1, -1);
+    return server ? serve(target_hz, pi_address) : radio_session(probe, target_hz, capture_snapshot, -1, -1);
 }

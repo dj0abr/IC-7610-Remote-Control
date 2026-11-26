@@ -18,7 +18,7 @@ Die USB-Anbindung folgt der [Icom I/Q-Referenz](https://www.icomjapan.com/suppor
 
 ## I/Q über Ethernet
 
-Der Pi lauscht standardmäßig auf `192.168.10.140:50010`. Für eine andere lokale Pi-Adresse vor dem Build `pi_address` in `iq-test.c` anpassen. Ein TCP-Verbindungsaufbau startet die I/Q-Ausgabe. Pro Sitzung empfängt ein Arbeitsplatz. Bei Verbindungsende prüft der Pi die Wiederherstellung der temporären SUB-Einstellungen. Der Pi verwendet die beim Start angegebene SUB-Frequenz als Ausgangswert für neue Sitzungen.
+Der Pi lauscht standardmäßig auf `192.168.10.140:50010`. Eine andere lokale Pi-Adresse mit `--listen IPv4` angeben. Ein TCP-Verbindungsaufbau startet die I/Q-Ausgabe. Pro Sitzung empfängt ein Arbeitsplatz. Bei Verbindungsende prüft der Pi die Wiederherstellung der temporären SUB-Einstellungen. Der Pi verwendet die beim Start angegebene SUB-Frequenz als Ausgangswert für neue Sitzungen.
 
 Auf dem Pi:
 
