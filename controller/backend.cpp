@@ -1423,6 +1423,7 @@ private:
             updateDemodulator();
             if (paused)
             {
+                m_iqClock.resetOrigin();
                 m_deadline.stop();
             }
             else if (m_pi.state() == QAbstractSocket::UnconnectedState)
@@ -1803,6 +1804,7 @@ private:
             }
         }
 
+        const auto endAudioSample = static_cast<qint64>(endIndex / iqPerFtSample);
         int offset = 0;
         while (offset < completeBytes)
         {
@@ -1818,8 +1820,7 @@ private:
             }
             else
             {
-                m_iqClock.establishOrigin(received, static_cast<qint64>(endIndex / iqPerFtSample));
-                samples(reinterpret_cast<const char*>(frame + 12), payload, m_index);
+                samples(reinterpret_cast<const char*>(frame + 12), payload, m_index, received, endAudioSample);
                 m_index += length / 4;
             }
             offset += 12 + payload;
@@ -1882,7 +1883,7 @@ private:
         }, Qt::QueuedConnection);
     }
 
-    void samples(const char* data, int length, quint64 firstIq)
+    void samples(const char* data, int length, quint64 firstIq, ft8::Time received, qint64 endAudioSample)
     {
         if (m_rxPaused || !m_active || !m_gui)
         {
@@ -1893,10 +1894,12 @@ private:
         {
             resetSpectrum();
             m_iqGap = true;
+            m_iqClock.resetOrigin();
             m_demodulator.clearNotchDetection();
             publishNotchFrequency();
             return;
         }
+        m_iqClock.establishOrigin(received, endAudioSample);
         if (m_demodulating || m_ftDemodulating)
         {
             if (std::exchange(m_iqGap, false))
