@@ -929,15 +929,17 @@ private:
             submit(m_ft->command(ft8::Command(Type::Abort)));
             return;
         }
-        if (operation == QStringLiteral("ft_arm") && request.value(QStringLiteral("armed")).isBool() &&
-            !request.value(QStringLiteral("armed")).toBool())
+        const auto requestedArm = operation == QStringLiteral("ft_arm")
+            ? request.value(QStringLiteral("armed")) : QJsonValue();
+        if (requestedArm.isBool() && !requestedArm.toBool())
         {
             submit(disarmFt());
             sendFtState();
             return;
         }
-        const auto automatic = request.value(QStringLiteral("auto")).toString();
-        if (operation == QStringLiteral("ft_auto") && automatic == QStringLiteral("off"))
+        const auto automatic = operation == QStringLiteral("ft_auto")
+            ? request.value(QStringLiteral("auto")).toString() : QString();
+        if (automatic == QStringLiteral("off"))
         {
             submit(m_ft->command(ft8::Command(Type::SetAuto)));
             return;
@@ -947,64 +949,69 @@ private:
             ftReply(request, false, QStringLiteral("TX ist belegt oder MAIN ist nicht sendebereit."));
             return;
         }
-        if (operation == QStringLiteral("ft_arm") && request.value(QStringLiteral("armed")).toBool())
+        if (requestedArm.toBool())
         {
             const bool queued = m_ft->command(ft8::Command(Type::ArmTx));
             m_ftTxAuthorized = m_ftTxAuthorized || queued;
             submit(queued);
+            return;
         }
-        else if (!m_ftTxAuthorized)
+        if (!m_ftTxAuthorized)
         {
             ftReply(request, false, QStringLiteral("FT-TX zuerst freigeben."));
+            return;
         }
-        else if (operation == QStringLiteral("ft_auto") &&
-                 (automatic == QStringLiteral("call-cq") || automatic == QStringLiteral("answer-cq")))
+        if (automatic == QStringLiteral("call-cq") || automatic == QStringLiteral("answer-cq"))
         {
             ft8::Command command(Type::SetAuto);
             command.automatic = automatic == QStringLiteral("call-cq") ? ft8::AutoMode::CallCQ : ft8::AutoMode::AnswerCQ;
             submit(m_ft->command(command));
+            return;
         }
-        else if (operation == QStringLiteral("ft_cq") || operation == QStringLiteral("ft_start_qso"))
-        {
-            ft8::Command command(operation == QStringLiteral("ft_cq") ? Type::CallCQ : Type::StartQso);
-            const auto requestedParity = request.value(QStringLiteral("parity"));
-            if (!requestedParity.isUndefined())
-            {
-                const int parity = requestedParity.toInt(-1);
-                if (parity != 0 && parity != 1)
-                {
-                    ftReply(request, false, QStringLiteral("Ungültige Slotparität."));
-                    return;
-                }
-                command.tx_parity = parity;
-            }
-            if (command.type == Type::StartQso)
-            {
-                command.peer = request.value(QStringLiteral("peer")).toString().trimmed().toUpper().toStdString();
-                const auto id = request.value(QStringLiteral("decode_id")).toString();
-                if (!id.isEmpty())
-                {
-                    const auto selected = std::ranges::find_if(m_ftDecodes, [&](const auto& row) {
-                        return QString::number(row.first) == id;
-                    });
-                    if (selected == m_ftDecodes.end() || selected->second.message.source != command.peer)
-                    {
-                        ftReply(request, false, QStringLiteral("Decode ist veraltet oder passt nicht zum Rufzeichen."));
-                        return;
-                    }
-                    command.selected = selected->second;
-                }
-            }
-            submit(m_ft->command(std::move(command)));
-        }
-        else if (operation == QStringLiteral("ft_free_text"))
+        if (operation == QStringLiteral("ft_free_text"))
         {
             submit(m_ft->send_free_text(request.value(QStringLiteral("text")).toString().toStdString()));
+            return;
         }
-        else
+
+        const bool startQso = operation == QStringLiteral("ft_start_qso");
+        if (!startQso && operation != QStringLiteral("ft_cq"))
         {
             ftReply(request, false, QStringLiteral("Ungültiger FT-Befehl."));
+            return;
         }
+        ft8::Command command(startQso ? Type::StartQso : Type::CallCQ);
+        const auto requestedParity = request.value(QStringLiteral("parity"));
+        if (!requestedParity.isUndefined())
+        {
+            const int parity = requestedParity.toInt(-1);
+            if (parity != 0 && parity != 1)
+            {
+                ftReply(request, false, QStringLiteral("Ungültige Slotparität."));
+                return;
+            }
+            command.tx_parity = parity;
+        }
+        if (startQso)
+        {
+            command.peer = request.value(QStringLiteral("peer")).toString().trimmed().toUpper().toStdString();
+            const auto id = request.value(QStringLiteral("decode_id")).toString();
+            if (!id.isEmpty())
+            {
+                const auto decodeId = id.toULongLong();
+                // Match the exact decimal form emitted in ft-decode.
+                const auto selected = QString::number(decodeId) == id
+                    ? std::ranges::find_if(m_ftDecodes, [&](const auto& row) { return row.first == decodeId; })
+                    : m_ftDecodes.end();
+                if (selected == m_ftDecodes.end() || selected->second.message.source != command.peer)
+                {
+                    ftReply(request, false, QStringLiteral("Decode ist veraltet oder passt nicht zum Rufzeichen."));
+                    return;
+                }
+                command.selected = selected->second;
+            }
+        }
+        submit(m_ft->command(std::move(command)));
     }
 
     void startFt()
