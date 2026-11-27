@@ -1,4 +1,5 @@
 #include "spectrum.hpp"
+#include "iq-utc-clock.hpp"
 #include "main-control.hpp"
 #include "ssb-demod.hpp"
 
@@ -991,11 +992,7 @@ private:
                         ftReply(request, false, QStringLiteral("Decode ist veraltet oder passt nicht zum Rufzeichen."));
                         return;
                     }
-                    const auto age = ft8::Time::clock::now() - selected->second.slot;
-                    if (age >= ft8::Time::duration::zero() && age < 2 * ft8::slot_duration(*m_ftMode))
-                    {
-                        command.selected = selected->second;
-                    }
+                    command.selected = selected->second;
                 }
             }
             submit(m_ft->command(std::move(command)));
@@ -1055,7 +1052,7 @@ private:
             m_ft.reset();
         }
         m_ftDecodes.clear();
-        m_ftAudioRejected = false;
+        m_ftAudioRejectionLogged = false;
         m_ftArmed = false;
         m_ftAuto = ft8::AutoMode::Off;
         m_ftState = ft8::State::Receiving;
@@ -1179,22 +1176,10 @@ private:
                 row.insert(QStringLiteral("decode_id"), QString::number(id));
                 row.insert(QStringLiteral("snr_db"), event.rx->snr_db);
                 row.insert(QStringLiteral("dt_s"), event.rx->dt_seconds);
-                if (event.armed && message.destination == m_ftConfig.callsign)
-                {
-                    const auto rxSlotEnd = event.utc + ft8::slot_duration(event.mode);
-                    qInfo().noquote() << "FT-RX" << QString::fromStdString(message.source)
-                        << "slot_utc_ms=" << utc
-                        << "after_slot_end_ms=" << utcMilliseconds(ft8::Time::clock::now()) - utcMilliseconds(rxSlotEnd)
-                        << "pass=" << event.rx->pass << "AP=" << event.rx->ap
-                        << "quality=" << event.rx->quality << QString::fromStdString(message.text);
-                }
             }
             else if (event.audio_start)
             {
-                const auto audioStart = utcMilliseconds(*event.audio_start);
-                row.insert(QStringLiteral("audio_start_ms"), audioStart);
-                qInfo().noquote() << "FT-TX" << "slot_utc_ms=" << utc
-                    << "audio_after_slot_start_ms=" << audioStart - utc << QString::fromStdString(message.text);
+                row.insert(QStringLiteral("audio_start_ms"), utcMilliseconds(*event.audio_start));
             }
             send(row);
             break;
@@ -1235,8 +1220,10 @@ private:
         case Type::CommandRejected:
         case Type::SlotMissed:
         case Type::Radio:
-            qInfo().noquote() << "FT" << "utc_ms=" << utcMilliseconds(event.utc)
-                << QString::fromStdString(event.detail);
+            if (event.type == Type::Radio)
+            {
+                qWarning("FT-Funkgerät: %s", event.detail.c_str());
+            }
             sendFtNotice(event.type == Type::SlotMissed ? QStringLiteral("slot") : QStringLiteral("error"),
                          QString::fromStdString(event.detail));
             break;
@@ -1617,8 +1604,7 @@ private:
         m_data.clear();
         resetSpectrum();
         m_index = 0;
-        m_iqUtcSampleZero.reset();
-        m_iqTimingDisagreement.reset();
+        m_iqClock = {};
         m_iqGap = false;
         m_header = false;
         m_active = nullptr;
@@ -1747,8 +1733,7 @@ private:
         if (static_cast<int>(center) != m_center)
         {
             // Changing SUB restarts capture on the Pi and discards a settling block.
-            m_iqUtcSampleZero.reset();
-            m_iqTimingDisagreement.reset();
+            m_iqClock.resetOrigin();
             m_center = static_cast<int>(center);
         }
         if (requested != m_desired)
@@ -1781,8 +1766,10 @@ private:
 
         // Anchor the sample count at the end of the newest complete block in this
         // TCP read. Older blocks in the same read already spent time in the queue.
+        const auto steadyBefore = std::chrono::steady_clock::now();
         const auto received = ft8::Time::clock::now();
-        const auto steady = std::chrono::steady_clock::now();
+        const auto steadyAfter = std::chrono::steady_clock::now();
+        const auto clockReadTime = steadyAfter - steadyBefore;
         int completeBytes = 0;
         auto endIndex = m_index;
         while (m_data.size() - completeBytes >= 12)
@@ -1803,42 +1790,17 @@ private:
             endIndex += length / 4;
             completeBytes += 12 + payload;
         }
-        const auto observedOrigin = ft8::sample_index(received) - static_cast<qint64>(endIndex / iqPerFtSample);
-        if (endIndex != m_index)
+        // Ignore clock comparisons if this thread was descheduled while reading the clocks.
+        if (endIndex != m_index && clockReadTime <= std::chrono::milliseconds(5) &&
+            m_iqClock.observeSystemClock(received, steadyBefore + clockReadTime / 2))
         {
-            using namespace std::chrono_literals;
-            if (m_iqUtcSampleZero)
+            m_iqGap = true;
+            m_ftDecodes.clear();
+            if (m_ft && m_ftTxAuthorized)
             {
-                const auto elapsedError = (received - m_iqLastUtc) - (steady - m_iqLastSteady);
-                const auto disagreement = observedOrigin - *m_iqUtcSampleZero;
-                if (std::abs(disagreement) > ft8::sample_rate * 350 / 1000)
-                {
-                    if (!m_iqTimingDisagreement)
-                    {
-                        m_iqTimingDisagreement = steady;
-                    }
-                }
-                else
-                {
-                    m_iqTimingDisagreement.reset();
-                }
-
-                if (elapsedError < -150ms || elapsedError > 150ms ||
-                    (m_iqTimingDisagreement && steady - *m_iqTimingDisagreement >= 1s))
-                {
-                    m_iqUtcSampleZero.reset();
-                    m_iqTimingDisagreement.reset();
-                    m_iqGap = true;
-                    m_ftDecodes.clear();
-                    if (m_ft && m_ftTxAuthorized)
-                    {
-                        disarmFt();
-                        sendFtNotice(QStringLiteral("error"), QStringLiteral("UTC-Zuordnung des I/Q-Stroms wurde neu bestimmt."));
-                    }
-                }
+                disarmFt();
+                sendFtNotice(QStringLiteral("error"), QStringLiteral("Die Systemuhr wurde verstellt. FT-TX wurde gesperrt."));
             }
-            m_iqLastUtc = received;
-            m_iqLastSteady = steady;
         }
 
         int offset = 0;
@@ -1856,10 +1818,7 @@ private:
             }
             else
             {
-                if (!m_iqUtcSampleZero)
-                {
-                    m_iqUtcSampleZero = observedOrigin;
-                }
+                m_iqClock.establishOrigin(received, static_cast<qint64>(endIndex / iqPerFtSample));
                 samples(reinterpret_cast<const char*>(frame + 12), payload, m_index);
                 m_index += length / 4;
             }
@@ -1971,27 +1930,28 @@ private:
 
     void submitFtAudio(quint64 firstIq, std::span<const float> audio)
     {
-        if (!m_ft || !m_iqUtcSampleZero || audio.empty())
+        const auto sampleZero = m_iqClock.sampleZero();
+        if (!m_ft || !sampleZero || audio.empty())
         {
             return;
         }
-        const auto firstAudio = *m_iqUtcSampleZero + static_cast<qint64>(firstIq / iqPerFtSample);
+        const auto firstAudio = *sampleZero + static_cast<qint64>(firstIq / iqPerFtSample);
         m_ftPcm.resize(audio.size());
         std::transform(audio.begin(), audio.end(), m_ftPcm.begin(), [](float sample) {
             return static_cast<ft8::Sample>(std::clamp(std::lround(sample * 32768), -32768L, 32767L));
         });
         const bool submitted = m_ft->submit_audio(firstAudio, m_ftPcm);
-        if (!submitted && !m_ftAudioRejected)
+        if (!submitted && !m_ftAudioRejectionLogged)
         {
+            m_ftAudioRejectionLogged = true;
             qWarning("FT-RX: Audioblock abgewiesen");
         }
-        m_ftAudioRejected = !submitted;
     }
 
     QSettings m_settings;
     std::unique_ptr<ft8::Transceiver> m_ft;
     std::vector<ft8::Sample> m_ftPcm;
-    bool m_ftAudioRejected = false;
+    bool m_ftAudioRejectionLogged = false;
     struct FtRadio
     {
         quint64 token;
@@ -2045,11 +2005,8 @@ private:
     QByteArray m_data;
     QByteArray m_samples;
     quint64 m_index = 0;
-    std::optional<qint64> m_iqUtcSampleZero;
+    IqUtcClock m_iqClock;
     bool m_iqGap = false;
-    ft8::Time m_iqLastUtc{};
-    std::chrono::steady_clock::time_point m_iqLastSteady{};
-    std::optional<std::chrono::steady_clock::time_point> m_iqTimingDisagreement;
     int m_center = 0;
     int m_rate = 0;
     qint64 m_mainHz = 0;

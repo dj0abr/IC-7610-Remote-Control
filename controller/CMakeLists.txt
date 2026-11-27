@@ -58,3 +58,11 @@ target_compile_options(kmcontrol-web PRIVATE -Wall -Wextra -Wpedantic)
 
 install(TARGETS kmcontrol-backend kmcontrol-web RUNTIME DESTINATION .)
 install(FILES "$<TARGET_FILE:libft8::libft8>" "$<TARGET_SONAME_FILE:libft8::libft8>" DESTINATION .)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(iq-utc-clock-test tests/iq-utc-clock.cpp)
+    target_link_libraries(iq-utc-clock-test PRIVATE libft8::libft8)
+    target_compile_options(iq-utc-clock-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME iq-utc-clock COMMAND iq-utc-clock-test)
+endif()

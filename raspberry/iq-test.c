@@ -33,6 +33,7 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,19 @@ enum { CMD_OUT = 0x02, CMD_IN = 0x82, IQ_IN = 0x84, BLOCK_SIZE = 256 * 1024 };
 enum { CIV_RADIO = 0x98, CIV_PC = 0xe0, EXPECTED_BYTES_PER_SEC = 7680000 };
 
 static volatile sig_atomic_t interrupted;
+static int debug_enabled;
+static int log_session_errors = 1;
+
+static void session_error(const char *format, ...)
+{
+    if (!log_session_errors) {
+        return;
+    }
+    va_list arguments;
+    va_start(arguments, format);
+    vfprintf(stderr, format, arguments);
+    va_end(arguments);
+}
 
 static void stop(int signo)
 {
@@ -57,13 +71,13 @@ static FT_HANDLE open_icom(void)
     DWORD count = 0;
     FT_STATUS status = FT_CreateDeviceInfoList(&count);
     if (status != FT_OK || count == 0) {
-        fprintf(stderr, "FTDI-Gerätesuche: Status %u, %u Geräte.\n", status, count);
+        session_error("FTDI-Gerätesuche: Status %u, %u Geräte.\n", status, count);
         return NULL;
     }
 
     FT_DEVICE_LIST_INFO_NODE *nodes = calloc(count, sizeof(*nodes));
     if (!nodes) {
-        perror("FTDI-Geräteliste");
+        session_error("FTDI-Geräteliste: %s.\n", strerror(errno));
         return NULL;
     }
     status = FT_GetDeviceInfoList(nodes, &count);
@@ -74,12 +88,12 @@ static FT_HANDLE open_icom(void)
                 continue;
             }
             if (!(nodes[i].Flags & FT_FLAGS_SUPERSPEED)) {
-                fprintf(stderr, "Der IC-7610 hat keinen SuperSpeed-Link.\n");
+                session_error("Der IC-7610 hat keinen SuperSpeed-Link.\n");
                 break;
             }
             status = FT_Create((void *)(uintptr_t)i, FT_OPEN_BY_INDEX, &handle);
             if (status != FT_OK) {
-                fprintf(stderr, "IC-7610 öffnen: FTDI-Status %u.\n", status);
+                session_error("IC-7610 öffnen: FTDI-Status %u.\n", status);
                 handle = NULL;
             }
             break;
@@ -87,7 +101,7 @@ static FT_HANDLE open_icom(void)
     }
     free(nodes);
     if (handle == NULL) {
-        fprintf(stderr, "IC-7610 (0c26:0029) konnte nicht geöffnet werden.\n");
+        session_error("IC-7610 (0c26:0029) konnte nicht geöffnet werden.\n");
     }
     return handle;
 }
@@ -106,8 +120,8 @@ static int civ(FT_HANDLE handle, const uint8_t *command, size_t command_size,
     ULONG transferred = 0;
     FT_STATUS status = FT_WritePipe(handle, CMD_OUT, request, length, &transferred, 1000);
     if (status != FT_OK || transferred != length) {
-        fprintf(stderr, "CI-V %02X senden: FTDI-Status %u, %u/%zu Byte.\n",
-                command[0], status, transferred, length);
+        session_error("CI-V %02X senden: FTDI-Status %u, %u/%zu Byte.\n",
+                      command[0], status, transferred, length);
         return 0;
     }
 
@@ -116,11 +130,11 @@ static int civ(FT_HANDLE handle, const uint8_t *command, size_t command_size,
         transferred = 0;
         status = FT_ReadPipe(handle, CMD_IN, response, sizeof(response), &transferred, 350);
         if (status != FT_OK && status != FT_TIMEOUT) {
-            fprintf(stderr, "CI-V %02X empfangen: FTDI-Status %u.\n", command[0], status);
+            session_error("CI-V %02X empfangen: FTDI-Status %u.\n", command[0], status);
             return 0;
         }
 
-        if (getenv("IQ_DEBUG")) {
+        if (debug_enabled) {
             fprintf(stderr, "USB-CI-V %02X %02X RX (FTDI %u, %u Byte):",
                     command[0], command_size > 1 ? command[1] : 0, status, transferred);
             for (size_t i = 0; i < transferred && i < 64; ++i) {
@@ -135,8 +149,8 @@ static int civ(FT_HANDLE handle, const uint8_t *command, size_t command_size,
             const uint8_t *body = response + i + 4;
             const size_t available = transferred - i - 4;
             if (body[0] == 0xfa && body[1] == 0xfd) {
-                fprintf(stderr, "IC-7610 hat CI-V %02X %02X abgewiesen.\n",
-                        command[0], command_size > 1 ? command[1] : 0);
+                session_error("IC-7610 hat CI-V %02X %02X abgewiesen.\n",
+                              command[0], command_size > 1 ? command[1] : 0);
                 return 0;
             }
             if (reply_size == 0) {
@@ -152,8 +166,8 @@ static int civ(FT_HANDLE handle, const uint8_t *command, size_t command_size,
         }
         nanosleep(&(const struct timespec){.tv_nsec = 20000000L}, NULL);
     }
-    fprintf(stderr, "Keine passende USB-CI-V-Antwort für %02X %02X.\n",
-            command[0], command_size > 1 ? command[1] : 0);
+    session_error("Keine passende USB-CI-V-Antwort für %02X %02X.\n",
+                  command[0], command_size > 1 ? command[1] : 0);
     return 0;
 }
 
@@ -251,7 +265,7 @@ static int read_samples(FT_HANDLE handle, uint8_t *buffer, ULONG *count, int pri
     }
     if ((status != FT_OK && status != FT_TIMEOUT) || *count == 0 ||
         *count > BLOCK_SIZE || *count % 4 != 0) {
-        fprintf(stderr, "I/Q-Lesevorgang: FTDI-Status %u, %u Byte.\n", status, *count);
+        session_error("I/Q-Lesevorgang: FTDI-Status %u, %u Byte.\n", status, *count);
         return 0;
     }
     return 1;
@@ -372,7 +386,9 @@ static int handle_control(FT_HANDLE handle, int client, const char *command,
         return -2;
     }
     *center = target;
-    printf("SUB auf %" PRIu64 " Hz eingestellt und zurückgelesen.\n", target);
+    if (debug_enabled) {
+        printf("SUB auf %" PRIu64 " Hz eingestellt und zurückgelesen.\n", target);
+    }
     return send_control_reply(client, sample_index, CONTROL_OK, *center);
 }
 
@@ -425,12 +441,14 @@ static int stream_tcp(FT_HANDLE handle, int listener, int client, uint64_t targe
             sample_index += count / 4;
         }
     }
-    fprintf(stdout, "TCP-Sitzung: %" PRIu64 " komplexe Samples in %.2f s gesendet.\n",
-            sample_index, seconds() - start);
+    if (debug_enabled) {
+        printf("TCP-Sitzung: %" PRIu64 " komplexe Samples in %.2f s gesendet.\n",
+               sample_index, seconds() - start);
+    }
     if (result < 0 && !interrupted) {
-        fprintf(stderr, "%s\n", result == -2
-                ? "TCP-Sitzung beendet: SUB-Umschaltung fehlgeschlagen."
-                : "TCP-Sitzung beendet: Empfänger liest zu langsam.");
+        session_error("%s\n", result == -2
+                      ? "TCP-Sitzung beendet: SUB-Umschaltung fehlgeschlagen."
+                      : "TCP-Sitzung beendet: Empfänger liest zu langsam.");
         return 0;
     }
     return 1;
@@ -491,7 +509,10 @@ static int test_stream(FT_HANDLE handle, FILE *report, uint8_t *snapshot, size_t
 static int radio_session(int probe, uint64_t target_hz, int capture_snapshot,
                          int listener, int client)
 {
-    FILE *report = capture_snapshot ? stderr : stdout;
+    FILE *report = client < 0 || debug_enabled ? stdout : NULL;
+    if (capture_snapshot) {
+        report = stderr;
+    }
     const uint8_t get_main[] = {0x25, 0x00};
     const uint8_t get_sub[] = {0x25, 0x01};
     const uint8_t get_dual[] = {0x07, 0xc2};
@@ -513,29 +534,33 @@ static int radio_session(int probe, uint64_t target_hz, int capture_snapshot,
     FT_SetPipeTimeout(handle, IQ_IN, 2000);
 
     if (!read_civ(handle, get_iq, sizeof(get_iq), &iq_before, 1) || iq_before > 2) {
-        fprintf(stderr, "I/Q-Auswahl konnte nicht gelesen werden.\n");
+        session_error("I/Q-Auswahl konnte nicht gelesen werden.\n");
         goto cleanup;
     }
-    fprintf(report, "I/Q-Auswahl: %u (0 = aus, 1 = MAIN, 2 = SUB).\n", iq_before);
+    if (report) {
+        fprintf(report, "I/Q-Auswahl: %u (0 = aus, 1 = MAIN, 2 = SUB).\n", iq_before);
+    }
     if (probe) {
         passed = 1;
         goto cleanup;
     }
 
     if (!read_civ(handle, get_tx, sizeof(get_tx), &tx, 1) || tx != 0) {
-        fprintf(stderr, "Der Test setzt voraus, dass das Gerät im Empfang ist.\n");
+        session_error("Der Test setzt voraus, dass das Gerät im Empfang ist.\n");
         goto cleanup;
     }
     if (!read_civ(handle, get_main, sizeof(get_main), main_before, sizeof(main_before)) ||
         !read_civ(handle, get_sub, sizeof(get_sub), sub_before, sizeof(sub_before)) ||
         !read_civ(handle, get_dual, sizeof(get_dual), &dual_before, 1) ||
         dual_before > 1) {
-        fprintf(stderr, "Der Ausgangszustand konnte nicht vollständig gelesen werden.\n");
+        session_error("Der Ausgangszustand konnte nicht vollständig gelesen werden.\n");
         goto cleanup;
     }
-    fprintf(report, "Ausgangszustand: MAIN %" PRIu64 " Hz, SUB %" PRIu64
-           " Hz, Dualwatch %u, I/Q-Auswahl %u\n",
-           frequency(main_before), frequency(sub_before), dual_before, iq_before);
+    if (report) {
+        fprintf(report, "Ausgangszustand: MAIN %" PRIu64 " Hz, SUB %" PRIu64
+               " Hz, Dualwatch %u, I/Q-Auswahl %u\n",
+               frequency(main_before), frequency(sub_before), dual_before, iq_before);
+    }
 
     if (interrupted || (client >= 0 && client_left(client))) {
         passed = 1;
@@ -557,7 +582,7 @@ static int radio_session(int probe, uint64_t target_hz, int capture_snapshot,
     if (!verify_sub_frequency(handle, target_sub) ||
         !read_civ(handle, get_main, sizeof(get_main), observed, sizeof(observed)) ||
         memcmp(observed, main_before, sizeof(main_before)) != 0) {
-        fprintf(stderr, "Frequenzkontrolle fehlgeschlagen.\n");
+        session_error("Frequenzkontrolle fehlgeschlagen.\n");
         goto cleanup;
     }
 
@@ -568,12 +593,14 @@ static int radio_session(int probe, uint64_t target_hz, int capture_snapshot,
         }
     }
     if (!read_civ(handle, get_iq, sizeof(get_iq), &selected, 1) || selected != 2) {
-        fprintf(stderr, "I/Q-Quelle SUB konnte nicht bestätigt werden.\n");
+        session_error("I/Q-Quelle SUB konnte nicht bestätigt werden.\n");
         goto cleanup;
     }
 
     if (client >= 0) {
-        fprintf(report, "SUB I/Q bei %" PRIu64 " Hz über TCP.\n", target_hz);
+        if (report) {
+            fprintf(report, "SUB I/Q bei %" PRIu64 " Hz über TCP.\n", target_hz);
+        }
         passed = stream_tcp(handle, listener, client, target_hz, &changed_sub, &changed_iq);
     } else {
         fprintf(report, "SUB I/Q bei %" PRIu64 " Hz, Messdauer 10 s.\n", target_hz);
@@ -605,8 +632,10 @@ cleanup:
                     selected == dual_before;
         restored &= read_civ(handle, get_iq, sizeof(get_iq), &selected, 1) &&
                     selected == iq_before;
-        fprintf(report, "Ausgangszustand %s.\n", restored ? "wiederhergestellt und geprüft"
-                                                  : "nicht vollständig bestätigt");
+        if (report) {
+            fprintf(report, "Ausgangszustand %s.\n", restored ? "wiederhergestellt und geprüft"
+                                                      : "nicht vollständig bestätigt");
+        }
     }
     FT_AbortPipe(handle, IQ_IN);
     FT_Close(handle);
@@ -643,6 +672,7 @@ static int serve(uint64_t target_hz, const char *pi_address)
            pi_address, TCP_PORT, target_hz);
 
     int exit_status = 0;
+    double next_error_log = 0;
     while (!interrupted) {
         struct pollfd socket = {.fd = listener, .events = POLLIN};
         int ready = poll(&socket, 1, 1000);
@@ -672,8 +702,11 @@ static int serve(uint64_t target_hz, const char *pi_address)
         const int buffer_size = BLOCK_SIZE;
         setsockopt(client, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
         char peer_ip[INET_ADDRSTRLEN] = "?";
-        inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
-        printf("I/Q-Client %s:%u verbunden.\n", peer_ip, ntohs(peer.sin_port));
+        if (debug_enabled) {
+            inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
+            printf("I/Q-Client %s:%u verbunden.\n", peer_ip, ntohs(peer.sin_port));
+        }
+        log_session_errors = debug_enabled || seconds() >= next_error_log;
         const int result = radio_session(0, target_hz, 0, listener, client);
         close(client);
         if (result == 2) {
@@ -681,7 +714,14 @@ static int serve(uint64_t target_hz, const char *pi_address)
             exit_status = 1;
             break;
         }
-        printf("I/Q-Client %s:%u getrennt.\n", peer_ip, ntohs(peer.sin_port));
+        if (result == 0) {
+            next_error_log = 0;
+        } else if (log_session_errors) {
+            next_error_log = seconds() + 60;
+        }
+        if (debug_enabled) {
+            printf("I/Q-Client %s:%u getrennt.\n", peer_ip, ntohs(peer.sin_port));
+        }
     }
     close(listener);
     return exit_status;
@@ -689,6 +729,7 @@ static int serve(uint64_t target_hz, const char *pi_address)
 
 int main(int argc, char **argv)
 {
+    debug_enabled = getenv("IQ_DEBUG") != NULL;
     const int probe = argc == 2 && strcmp(argv[1], "--probe") == 0;
     const int server = argc > 1 && strcmp(argv[1], "--serve") == 0;
     const char *pi_address = default_pi_address;

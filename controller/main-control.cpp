@@ -761,6 +761,7 @@ void MainControl::bandChanged(quint64 session)
 
 void MainControl::applyMicGain()
 {
+    const bool firstAttempt = m_micGainDue == 0;
     m_micGainDue.reset();
     try
     {
@@ -772,7 +773,10 @@ void MainControl::applyMicGain()
     }
     catch (const std::exception& error)
     {
-        qWarning("MIC GAIN 50%%: %s", error.what());
+        if (firstAttempt)
+        {
+            qWarning("MIC GAIN 50%%: %s", error.what());
+        }
         m_micGainDue = m_clock.elapsed() + 1500;
     }
 }

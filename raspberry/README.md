@@ -20,6 +20,8 @@ Die USB-Anbindung folgt der [Icom I/Q-Referenz](https://www.icomjapan.com/suppor
 
 Der Pi lauscht standardmäßig auf `192.168.10.140:50010`. Eine andere lokale Pi-Adresse mit `--listen IPv4` angeben. Ein TCP-Verbindungsaufbau startet die I/Q-Ausgabe. Pro Sitzung empfängt ein Arbeitsplatz. Bei Verbindungsende prüft der Pi die Wiederherstellung der temporären SUB-Einstellungen. Der Pi verwendet die beim Start angegebene SUB-Frequenz als Ausgangswert für neue Sitzungen.
 
+Im laufenden Serverbetrieb werden normale Verbindungen und Bandwechsel still behandelt. Nach einem Sitzungsfehler werden weitere fehlgeschlagene Verbindungsversuche höchstens einmal pro Minute protokolliert. `IQ_DEBUG=1` aktiviert die ausführliche USB- und Sitzungsdiagnose.
+
 Auf dem Pi:
 
 ```sh
