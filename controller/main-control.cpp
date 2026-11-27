@@ -1,10 +1,13 @@
 #include "main-control.hpp"
 
-#include <QDateTime>
+#include <QtEndian>
 #include <algorithm>
-#include <cstdlib>
+#include <cmath>
 #include <exception>
 #include <numeric>
+#include <liquid.h>
+#include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 using namespace std::chrono_literals;
@@ -12,7 +15,43 @@ using namespace std::chrono_literals;
 namespace
 {
 constexpr auto latchTimeout = 5min;
-constexpr auto digitalLead = 280ms;
+using RadioStatus = ft8::RadioReport::Status;
+
+QByteArray digitalTxPcm(std::span<const ft8::Sample> wave, int level)
+{
+    constexpr int inputCount = 3;
+    constexpr int outputCount = 4;
+    static_assert(ft8::sample_rate * outputCount == icom::txAudioRate * inputCount);
+    using Resampler = std::unique_ptr<std::remove_pointer_t<rresamp_rrrf>, decltype(&rresamp_rrrf_destroy)>;
+    const Resampler resampler(rresamp_rrrf_create_kaiser(outputCount, inputCount, 16, 0.48f, 80.0f),
+                              rresamp_rrrf_destroy);
+    if (!resampler)
+    {
+        throw std::runtime_error("FT-TX-Resampler nicht verfügbar.");
+    }
+    rresamp_rrrf_set_scale(resampler.get(), 1.0f);
+    const auto groups = (wave.size() + inputCount - 1) / inputCount;
+    QByteArray pcm(static_cast<int>(groups * outputCount * sizeof(qint16)), Qt::Uninitialized);
+    std::array<float, inputCount> input{};
+    std::array<float, outputCount> output{};
+    const float gain = level / 100.0f;
+    int position = 0;
+    for (std::size_t i = 0; i < wave.size(); i += inputCount)
+    {
+        for (std::size_t j = 0; j < input.size(); ++j)
+        {
+            input[j] = i + j < wave.size() ? wave[i + j] : 0;
+        }
+        rresamp_rrrf_execute(resampler.get(), input.data(), output.data());
+        for (const auto sample : output)
+        {
+            const auto value = static_cast<qint16>(std::clamp(std::lround(sample * gain), -32768L, 32767L));
+            qToLittleEndian(value, pcm.data() + position);
+            position += sizeof(value);
+        }
+    }
+    return pcm;
+}
 
 struct RadioSettingCommands
 {
@@ -98,7 +137,12 @@ void MainControl::stop()
     }
     m_radio.reset();
     m_requested.reset();
-    m_digitalTx.reset();
+    if (m_digitalTx)
+    {
+        emit digitalTxReported(m_session, m_digitalTx->token,
+                               {m_digitalTx->playback.id, RadioStatus::Failed, {}, "Funkgerät getrennt."});
+        m_digitalTx.reset();
+    }
     m_radioSettings = {};
     m_voiceSideband.reset();
     m_mainModePending = false;
@@ -243,26 +287,40 @@ void MainControl::updateTxMeters(Clock::time_point now, std::chrono::millisecond
     m_nextTxMeter = now + 180ms;
 }
 
-void MainControl::scheduleDigitalTx(quint64 session, quint64 id, qint64 dialHz, qint64 audioUtcMs, QByteArray pcm)
+void MainControl::scheduleDigitalTx(quint64 session, quint64 token, qint64 dialHz,
+                                    ft8::Playback playback, int level)
 {
-    if (session != m_session || !m_timer->isActive() || m_digitalTx || m_ownedTx || !m_radio)
+    if (session != m_session || !m_timer->isActive() || m_digitalTx || m_ownedTx || !m_radio ||
+        !playback.frame || playback.frame->samples.empty() || m_cancelDigitalId.load() == token)
     {
-        emit digitalTxChanged(session, id, QStringLiteral("idle"), QStringLiteral("unavailable"), {});
+        emit digitalTxReported(session, token, {playback.id, RadioStatus::Failed, {}, "FT-TX nicht verfügbar."});
         return;
     }
-    const auto untilAudio = std::chrono::milliseconds(audioUtcMs - QDateTime::currentMSecsSinceEpoch());
-    m_digitalTx = DigitalTx{id, dialHz, audioUtcMs, Clock::now() + untilAudio, std::move(pcm)};
+    try
+    {
+        auto pcm = digitalTxPcm(playback.frame->samples, level);
+        const auto utc = ft8::Time::clock::now();
+        const auto steady = Clock::now();
+        const auto packetAt = steady + (playback.audio_start - utc) - icom::txAudioBuffer;
+        const auto deadline = steady + (playback.ptt_deadline - utc);
+        m_digitalTx = DigitalTx{token, dialHz, std::move(playback), packetAt, deadline, std::move(pcm)};
+    }
+    catch (const std::exception& error)
+    {
+        emit digitalTxReported(session, token, {playback.id, RadioStatus::Failed, {}, error.what()});
+    }
 }
 
-void MainControl::finishDigitalTx(const QString& result, const QString& text)
+void MainControl::finishDigitalTx(RadioStatus status, std::string detail)
 {
-    const auto id = m_digitalTx->id;
+    const auto token = m_digitalTx->token;
+    const auto id = m_digitalTx->playback.id;
     if (m_digitalTx->keyed)
     {
         finishTx();
     }
     m_digitalTx.reset();
-    emit digitalTxChanged(m_session, id, QStringLiteral("idle"), result, text);
+    emit digitalTxReported(m_session, token, {id, status, {}, std::move(detail)});
 }
 
 bool MainControl::processDigitalTx(Clock::time_point now, bool settingWritePending)
@@ -272,116 +330,149 @@ bool MainControl::processDigitalTx(Clock::time_point now, bool settingWritePendi
         return false;
     }
     auto& job = *m_digitalTx;
-    const auto cancelled = [this, &job] { return m_cancelDigitalId.load() == job.id; };
-    if (cancelled())
+    const auto cancelled = [this, &job] { return m_cancelDigitalId.load() == job.token; };
+    const auto latestPacket = job.packetAt + (job.playback.latest_audio_start - job.playback.audio_start);
+    if (cancelled() || now >= job.deadline)
     {
-        finishDigitalTx(QStringLiteral("stopped"));
+        finishDigitalTx(RadioStatus::Failed, cancelled() ? "FT-TX abgebrochen." : "PTT-Zeitlimit erreicht.");
         return true;
     }
-    const auto utcRemaining = job.audioUtcMs - QDateTime::currentMSecsSinceEpoch();
-    const auto clockRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(job.audioAt - now).count();
-    if (std::llabs(utcRemaining - clockRemaining) > 150)
+    const auto utc = ft8::Time::clock::now();
+    const auto offset = (job.playback.ptt_deadline - utc) - (job.deadline - now);
+    if (offset < -150ms || offset > 150ms)
     {
-        finishDigitalTx(QStringLiteral("clock_changed"));
+        finishDigitalTx(RadioStatus::Failed, "UTC-Uhr hat sich geändert.");
         return true;
     }
-    if (job.keyed)
+    if (!job.keyed)
     {
-        if (job.position == job.pcm.size())
+        std::string detail;
+        if (now > latestPacket)
         {
-            if (now >= m_nextAudio + 60ms)
-            {
-                finishDigitalTx(QStringLiteral("complete"));
-            }
+            detail = "FT-Sendefenster verpasst.";
+        }
+        else if (currentPtt().id || m_ownedTx || m_externalTx || m_requested || settingWritePending ||
+                 !m_radio->txAudioReady())
+        {
+            detail = "TX ist belegt oder nicht bereit.";
+        }
+        else if (static_cast<qint64>(m_radio->mainFrequency()) != job.dialHz)
+        {
+            detail = "MAIN wurde umgestimmt.";
+        }
+        else if (!m_radio->digitalTxMode())
+        {
+            detail = "FT-TX erfordert MAIN in USB ohne DATA und ausgeschaltetes Split.";
+        }
+        else if (!m_ftRadioSettingsActive || !m_compressorBeforeFt || m_radio->compressor() != 0)
+        {
+            detail = "TX-Kompressor ist für FT noch nicht ausgeschaltet.";
+        }
+        else if (!m_usbFilterBeforeFt || m_radio->mainIfFilterWidthCode() != icom::maxSsbIfFilterWidthCode ||
+                 m_radio->mainTwinPbt() != icom::centeredTwinPbt)
+        {
+            detail = "MAIN-USB-Filter ist für FT noch nicht auf 3,6 kHz.";
+        }
+        else if (m_radio->transmitting())
+        {
+            detail = "Der IC-7610 sendet bereits.";
+        }
+        else if (cancelled() || Clock::now() > latestPacket)
+        {
+            detail = "FT-TX abgebrochen oder Sendefenster verpasst.";
+        }
+        if (!detail.empty())
+        {
+            finishDigitalTx(RadioStatus::Failed, std::move(detail));
             return true;
         }
-        if (now >= m_nextAudio)
-        {
-            if (now - m_nextAudio > 75ms)
-            {
-                finishDigitalTx(QStringLiteral("underrun"));
-                return true;
-            }
-            m_radio->sendTxAudio({job.pcm.constData() + job.position, icom::txAudioBytes});
-            job.position += icom::txAudioBytes;
-            m_nextAudio += 20ms;
-        }
-        if (now >= m_nextTxStatus)
-        {
-            if (!m_radio->transmitting())
-            {
-                finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("Der IC-7610 hat TX beendet."));
-            }
-            m_nextTxStatus = now + 1s;
-        }
-        else if (now >= m_nextTxMeter)
-        {
-            const auto meterStart = Clock::now();
-            const auto budget = std::min(icom::txMeterTimeout,
-                std::chrono::floor<std::chrono::milliseconds>(m_nextAudio - meterStart - 2ms));
-            if (budget >= 7ms)
-            {
-                updateTxMeters(meterStart, budget);
-            }
-        }
-        return true;
-    }
-    if (now < job.audioAt - digitalLead)
-    {
-        return false;
-    }
-    if (now >= job.audioAt - 40ms)
-    {
-        finishDigitalTx(QStringLiteral("missed_slot"));
-    }
-    else if (m_ownedTx || m_externalTx || m_requested || settingWritePending || !m_radio->txAudioReady())
-    {
-        finishDigitalTx(QStringLiteral("unavailable"));
-    }
-    else if (static_cast<qint64>(m_radio->mainFrequency()) != job.dialHz)
-    {
-        finishDigitalTx(QStringLiteral("retuned"));
-    }
-    else if (!m_radio->digitalTxMode())
-    {
-        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("FT-TX erfordert MAIN in USB ohne DATA und ausgeschaltetes Split."));
-    }
-    else if (!m_ftRadioSettingsActive || !m_compressorBeforeFt || m_radio->compressor() != 0)
-    {
-        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("TX-Kompressor ist für FT noch nicht ausgeschaltet."));
-    }
-    else if (!m_usbFilterBeforeFt || m_radio->mainIfFilterWidthCode() != icom::maxSsbIfFilterWidthCode ||
-             m_radio->mainTwinPbt() != icom::centeredTwinPbt)
-    {
-        finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("MAIN-USB-Filter ist für FT noch nicht auf 3,6 kHz."));
-    }
-    else if (m_radio->transmitting())
-    {
-        finishDigitalTx(QStringLiteral("unavailable"));
-    }
-    else if (cancelled())
-    {
-        finishDigitalTx(QStringLiteral("stopped"));
-    }
-    else if (Clock::now() >= job.audioAt - 35ms)
-    {
-        finishDigitalTx(QStringLiteral("missed_slot"));
-    }
-    else
-    {
+
         job.keyed = true;
         reportTx(QStringLiteral("starting"), true);
         m_radio->setPtt(true);
         if (!m_radio->transmitting())
         {
-            finishDigitalTx(QStringLiteral("unavailable"), QStringLiteral("Der IC-7610 hat TX nicht bestätigt."));
+            finishDigitalTx(RadioStatus::Failed, "Der IC-7610 hat TX nicht bestätigt.");
+            return true;
         }
-        else
+        m_nextAudio = job.packetAt;
+        m_nextTxStatus = job.packetAt + 1s;
+        reportTx(QStringLiteral("tx"), true);
+        now = Clock::now();
+        if (cancelled() || now >= job.deadline)
         {
-            m_nextAudio = job.audioAt;
-            m_nextTxStatus = job.audioAt + 1s;
-            reportTx(QStringLiteral("tx"), true);
-            emit digitalTxChanged(m_session, job.id, QStringLiteral("sending"), {}, {});
+            finishDigitalTx(RadioStatus::Failed, "PTT wurde außerhalb des Sendefensters bestätigt.");
+            return true;
+        }
+    }
+
+    if (job.position == job.pcm.size())
+    {
+        if (now >= m_nextAudio + icom::txAudioBuffer)
+        {
+            finishDigitalTx(RadioStatus::Completed);
+        }
+        return true;
+    }
+    if (now >= m_nextAudio)
+    {
+        ft8::Time firstAudio{};
+        if (!job.started)
+        {
+            firstAudio = ft8::Time::clock::now() + icom::txAudioBuffer;
+            if (firstAudio < job.playback.audio_start)
+            {
+                m_nextAudio = now + (job.playback.audio_start - firstAudio);
+                return true;
+            }
+            const auto prefix = ft8::playback_offset(job.playback, firstAudio);
+            if (!prefix)
+            {
+                finishDigitalTx(RadioStatus::Failed, "FT-Audio konnte nicht rechtzeitig beginnen.");
+                return true;
+            }
+            const auto lanSamples = (*prefix * icom::txAudioRate + ft8::sample_rate - 1) / ft8::sample_rate;
+            job.position = static_cast<int>(lanSamples * sizeof(qint16));
+            m_nextAudio = now;
+        }
+        else if (now - m_nextAudio > 75ms)
+        {
+            finishDigitalTx(RadioStatus::Failed, "FT-Audiostrom unterbrochen.");
+            return true;
+        }
+        if (cancelled())
+        {
+            finishDigitalTx(RadioStatus::Failed, "FT-TX abgebrochen.");
+            return true;
+        }
+
+        const auto count = std::min(icom::txAudioBytes, job.pcm.size() - job.position);
+        std::array<char, icom::txAudioBytes> packet{};
+        std::copy_n(job.pcm.constData() + job.position, count, packet.begin());
+        m_radio->sendTxAudio(packet);
+        job.position += count;
+        m_nextAudio += 20ms;
+        if (!job.started)
+        {
+            job.started = true;
+            emit digitalTxReported(m_session, job.token, {job.playback.id, RadioStatus::Started, firstAudio, {}});
+        }
+    }
+    if (now >= m_nextTxStatus)
+    {
+        if (!m_radio->transmitting())
+        {
+            finishDigitalTx(RadioStatus::Failed, "Der IC-7610 hat TX beendet.");
+        }
+        m_nextTxStatus = now + 1s;
+    }
+    else if (now >= m_nextTxMeter)
+    {
+        const auto remaining = std::min(m_nextAudio, job.deadline) - Clock::now() - 2ms;
+        const auto budget = std::min(icom::txMeterTimeout, std::chrono::floor<std::chrono::milliseconds>(remaining));
+        if (budget >= 7ms)
+        {
+            updateTxMeters(now, budget);
         }
     }
     return true;
@@ -881,8 +972,8 @@ void MainControl::updateRadio()
             m_externalTx || m_txPhase == QStringLiteral("unknown");
         if (m_digitalTx)
         {
-            emit digitalTxChanged(m_session, m_digitalTx->id, QStringLiteral("idle"),
-                                  QStringLiteral("unavailable"), QString::fromUtf8(error.what()));
+            emit digitalTxReported(m_session, m_digitalTx->token,
+                                   {m_digitalTx->playback.id, RadioStatus::Failed, {}, error.what()});
             m_digitalTx.reset();
         }
         if (m_ownedTx)

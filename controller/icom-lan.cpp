@@ -585,7 +585,7 @@ public:
                 message[0x72] = message[0x73] = 0x04; // Mono LPCM16.
                 writeBe(message, 0x74, 4, txAudioRate);
                 writeBe(message, 0x78, 4, txAudioRate);
-                writeBe(message, 0x84, 4, 80); // TX buffer in milliseconds.
+                writeBe(message, 0x84, 4, txAudioBuffer.count());
             }
             control_.sendTracked(std::move(message));
             return waitFor(control_, PacketShape{0x50, 0});

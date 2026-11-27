@@ -1,19 +1,16 @@
 #include "spectrum.hpp"
 #include "main-control.hpp"
 #include "ssb-demod.hpp"
-#include "ft-receive.hpp"
-#include "ft-transmit.hpp"
-#include "ft_logbook.hpp"
-#include "qrz-logbook.hpp"
+
+#include <libft8/libft8.hpp>
 
 #include <QCoreApplication>
 #include <QCommandLineParser>
-#include <QDateTime>
 #include <QDebug>
+#include <QDir>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QStringList>
@@ -24,11 +21,13 @@
 #include <QtEndian>
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <csignal>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <span>
+#include <vector>
 #include <utility>
 
 namespace
@@ -41,6 +40,9 @@ constexpr int spectrumFps = 20;
 constexpr int audioFrameSamples = SsbDemodulator::audioRate / 50;
 constexpr qint64 streamQueueLimit = 128 * 1024;
 constexpr qint64 mainStepHz = 50;
+constexpr qint64 iqPerFtSample = SsbDemodulator::inputRate / ft8::sample_rate;
+static_assert(SsbDemodulator::inputRate % ft8::sample_rate == 0);
+static_assert(RxAudioFilter::sampleRate == ft8::sample_rate);
 volatile std::sig_atomic_t stopRequested = 0;
 
 void requestStop(int)
@@ -53,20 +55,20 @@ using NotchMode = RxNotch::Mode;
 
 const QStringList notchModes{QStringLiteral("off"), QStringLiteral("manual"), QStringLiteral("auto")};
 
-std::optional<FtMode> parseFtMode(const QString& mode)
+std::optional<ft8::Mode> parseFtMode(const QString& mode)
 {
     if (mode == QStringLiteral("FT8"))
     {
-        return FtMode::ft8;
+        return ft8::Mode::FT8;
     }
     if (mode == QStringLiteral("FT4"))
     {
-        return FtMode::ft4;
+        return ft8::Mode::FT4;
     }
     return std::nullopt;
 }
 
-qint64 ftStandardFrequency(const Band& band, FtMode mode)
+qint64 ftStandardFrequency(const Band& band, ft8::Mode mode)
 {
     struct Frequencies
     {
@@ -90,10 +92,64 @@ qint64 ftStandardFrequency(const Band& band, FtMode mode)
     {
         if (band.id == QLatin1String(entry.bandId))
         {
-            return mode == FtMode::ft4 ? entry.ft4 : entry.ft8;
+            return mode == ft8::Mode::FT4 ? entry.ft4 : entry.ft8;
         }
     }
     return 0;
+}
+
+QString ftModeName(ft8::Mode mode)
+{
+    return mode == ft8::Mode::FT4 ? QStringLiteral("FT4") : QStringLiteral("FT8");
+}
+
+QString ftAutoName(ft8::AutoMode automatic)
+{
+    switch (automatic)
+    {
+    case ft8::AutoMode::CallCQ: return QStringLiteral("call-cq");
+    case ft8::AutoMode::AnswerCQ: return QStringLiteral("answer-cq");
+    case ft8::AutoMode::Off: return QStringLiteral("off");
+    }
+    return {};
+}
+
+QString ftStateName(ft8::State state)
+{
+    switch (state)
+    {
+    case ft8::State::Receiving: return QStringLiteral("receiving");
+    case ft8::State::CallingCQ: return QStringLiteral("calling-cq");
+    case ft8::State::WaitingForReport: return QStringLiteral("report");
+    case ft8::State::WaitingForRogerReport: return QStringLiteral("roger-report");
+    case ft8::State::WaitingForAcknowledgment: return QStringLiteral("acknowledgment");
+    case ft8::State::Closing: return QStringLiteral("closing");
+    case ft8::State::SendingFreeText: return QStringLiteral("free-text");
+    }
+    return {};
+}
+
+QString ftOutcomeName(ft8::Outcome outcome)
+{
+    switch (outcome)
+    {
+    case ft8::Outcome::Completed: return QStringLiteral("completed");
+    case ft8::Outcome::Aborted: return QStringLiteral("aborted");
+    case ft8::Outcome::Timeout: return QStringLiteral("timeout");
+    case ft8::Outcome::RadioError: return QStringLiteral("radio-error");
+    case ft8::Outcome::ClockChanged: return QStringLiteral("clock-changed");
+    }
+    return {};
+}
+
+qint64 utcMilliseconds(ft8::Time utc)
+{
+    return std::chrono::floor<std::chrono::milliseconds>(utc.time_since_epoch()).count();
+}
+
+int ftMaxTxOffset(ft8::Mode mode)
+{
+    return mode == ft8::Mode::FT4 ? 3930 : 3950;
 }
 
 QString sidebandKey(const Band* band)
@@ -146,8 +202,7 @@ QJsonObject describeBand(const Band& band)
 class Backend : public QObject
 {
 public:
-    Backend(const QString& hostOverride, const QString& qrzApiKey)
-        : m_qrzLogbook(qrzApiKey)
+    Backend(const QString& hostOverride, const QString& qrzApiKey, int pttLeadMs)
     {
         m_host = m_settings.value(QStringLiteral("network/pi"), QStringLiteral("192.168.10.140")).toString();
         if (!hostOverride.isEmpty())
@@ -188,31 +243,22 @@ public:
         connect(&m_pi, &QTcpSocket::errorOccurred, this, &Backend::piError);
         connect(&m_retry, &QTimer::timeout, this, &Backend::connectPi);
         connect(&m_deadline, &QTimer::timeout, this, &Backend::piTimeout);
-        connect(&m_ftReceiver, &FtReceiver::decoded, this, &Backend::sendFtDecode);
-        connect(&m_ftReceiver, &FtReceiver::error, this, [this](const QString& text) {
-            send({{QStringLiteral("type"), QStringLiteral("ft-error")}, {QStringLiteral("text"), text}});
-        });
-        connect(&m_qrzLogbook, &QrzLogbook::status, this,
-                [this](const QString& call, const QString& state, const QString& text) {
-            if (state == QStringLiteral("error"))
-            {
-                qWarning().noquote() << "QRZ-Logbuch" << call << text;
-            }
-            send({{QStringLiteral("type"), QStringLiteral("ft-qrz-status")},
-                  {QStringLiteral("call"), call}, {QStringLiteral("state"), state}, {QStringLiteral("text"), text}});
-        });
         const auto dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-        if (!dataDir.isEmpty())
+        m_ftConfig.adif_log_path = QDir(dataDir).absoluteFilePath(QStringLiteral("ft4-ft8.adi")).toStdString();
+        if (!QDir().mkpath(dataDir))
         {
-            try
-            {
-                m_ftLogbook = std::make_unique<bridge::FtLogbook>((dataDir + QStringLiteral("/ft4-ft8.adi")).toStdString());
-            }
-            catch (const std::exception& error)
-            {
-                qWarning("FT-Logbuch: %s", error.what());
-            }
+            qWarning("FT-Logbuch: Datenverzeichnis konnte nicht angelegt werden.");
         }
+        m_ftConfig.callsign = m_settings.value(QStringLiteral("ft/callsign")).toString().toStdString();
+        m_ftConfig.locator = m_settings.value(QStringLiteral("ft/locator")).toString().toStdString();
+        m_ftConfig.tx_hz = std::clamp(m_settings.value(QStringLiteral("ft/tx_hz"), 1500).toInt(), 200, 3950);
+        m_ftLevel = std::clamp(m_settings.value(QStringLiteral("ft/tx_level"), 25).toInt(), 1, 100);
+        m_ftConfig.ptt_lead_ms = pttLeadMs;
+        m_ftConfig.qrz_api_key = qrzApiKey.trimmed().toStdString();
+        m_ftPoll.setInterval(5);
+        m_ftPoll.setTimerType(Qt::PreciseTimer);
+        connect(&m_ftPoll, &QTimer::timeout, this, &Backend::pollFt);
+        qRegisterMetaType<ft8::RadioReport>();
 
         m_mainControl->moveToThread(&m_mainThread);
         connect(&m_mainThread, &QThread::finished, m_mainControl, &QObject::deleteLater);
@@ -231,14 +277,14 @@ public:
         connect(m_mainControl, &MainControl::rxMeterChanged, this, &Backend::updateRxMeter);
         connect(m_mainControl, &MainControl::txMetersChanged, this, &Backend::updateTxMeters);
         connect(m_mainControl, &MainControl::txChanged, this, &Backend::updateTx);
-        connect(m_mainControl, &MainControl::digitalTxChanged, this, &Backend::updateFtTx);
+        connect(m_mainControl, &MainControl::digitalTxReported, this, &Backend::reportFtRadio);
         m_mainThread.start();
     }
 
     ~Backend() override
     {
         m_mainControl->cancelPtt();
-        cancelFtTx();
+        stopFt();
         if (m_gui)
         {
             disconnect(m_gui, nullptr, this, nullptr);
@@ -277,7 +323,7 @@ public:
         m_spectrumThread.setObjectName(QStringLiteral("kmcontrol-fft"));
         m_spectrumThread.start();
         qInfo("Web-Bridge-Schnittstelle auf 127.0.0.1:50020");
-        if (m_qrzLogbook.enabled() && m_ftLogbook)
+        if (!m_ftConfig.qrz_api_key.empty())
         {
             qInfo("Automatischer QRZ-Logbuch-Upload aktiv.");
         }
@@ -354,24 +400,9 @@ private:
                 handleTxInput(request, operation == QStringLiteral("ptt"));
                 continue;
             }
-            if (operation == QStringLiteral("ft_mode"))
+            if (operation.startsWith(QStringLiteral("ft_")))
             {
-                selectFtMode(request);
-                continue;
-            }
-            if (operation == QStringLiteral("ft8_tx_start"))
-            {
-                scheduleFtTx(request);
-                continue;
-            }
-            if (operation == QStringLiteral("ft8_tx_stop"))
-            {
-                cancelFtTx();
-                continue;
-            }
-            if (operation == QStringLiteral("ft_qso_log"))
-            {
-                logFtQso(request);
+                handleFtCommand(operation, request);
                 continue;
             }
             if ((m_rxPaused || m_clientPttId) &&
@@ -465,7 +496,7 @@ private:
                   {QStringLiteral("mode"), sidebandMode(m_sideband)}});
             if (newBand)
             {
-                cancelFtTx();
+                stopFt();
                 tuneMainToBand(*band);
             }
             if (m_pi.state() == QAbstractSocket::UnconnectedState)
@@ -521,9 +552,7 @@ private:
 
         if (m_radioAddress != radio)
         {
-            cancelFtTx();
-            m_ftJob.reset();
-            sendFtTx(QStringLiteral("idle"), 0, QStringLiteral("unavailable"));
+            stopFt();
             m_radioAddress = radio;
             setMainFrequency(0, false);
             sendMainStatus(QStringLiteral("MAIN: LAN-CI-V verbinden …"));
@@ -535,7 +564,7 @@ private:
         }
         if (m_host != pi)
         {
-            cancelFtTx();
+            stopFt();
             m_host = pi;
             m_pi.abort();
             m_deadline.stop();
@@ -702,13 +731,40 @@ private:
         }
     }
 
+    bool ftCanTransmit() const
+    {
+        return m_ft && m_ftDemodulating && m_mainConfirmed && m_txReady && !m_rxPaused && !m_clientPttId &&
+            !m_ftRadio && m_active && m_active == m_desired && m_active->id != QStringLiteral("cb") &&
+            m_mainHz >= m_active->lowHz && m_mainHz + ftTxOffset() + 70 <= m_active->highHz;
+    }
+
+    int ftTxOffset() const
+    {
+        return m_ftMode ? std::min(m_ftConfig.tx_hz, ftMaxTxOffset(*m_ftMode)) : m_ftConfig.tx_hz;
+    }
+
     void sendFtState()
     {
+        const auto now = ft8::Time::clock::now();
+        m_ftStateSent = std::chrono::steady_clock::now();
         send({{QStringLiteral("type"), QStringLiteral("ft-state")},
-              {QStringLiteral("mode"), QString::fromLatin1(m_ftMode ? ft_mode_name(*m_ftMode) : "off")},
-              {QStringLiteral("available"), m_ftReceiver.available()},
-              {QStringLiteral("log_available"), bool(m_ftLogbook)},
-              {QStringLiteral("utc_ms"), static_cast<double>(QDateTime::currentMSecsSinceEpoch())}});
+              {QStringLiteral("mode"), m_ftMode ? ftModeName(*m_ftMode) : QStringLiteral("off")},
+              {QStringLiteral("available"), true},
+              {QStringLiteral("ready"), bool(m_ft)},
+              {QStringLiteral("tx_ready"), ftCanTransmit()},
+              {QStringLiteral("armed"), m_ftArmed},
+              {QStringLiteral("sending"), m_ftRadio && m_ftRadio->started},
+              {QStringLiteral("busy"), m_ftState != ft8::State::Receiving || m_ftRadio.has_value()},
+              {QStringLiteral("state"), ftStateName(m_ftState)},
+              {QStringLiteral("auto"), ftAutoName(m_ftAuto)},
+              {QStringLiteral("peer"), m_ftPeer},
+              {QStringLiteral("retries"), static_cast<int>(m_ftRetries)},
+              {QStringLiteral("callsign"), QString::fromStdString(m_ftConfig.callsign)},
+              {QStringLiteral("locator"), QString::fromStdString(m_ftConfig.locator)},
+              {QStringLiteral("tx_hz"), ftTxOffset()},
+              {QStringLiteral("tx_level"), m_ftLevel},
+              {QStringLiteral("utc_ms"), utcMilliseconds(now)},
+              {QStringLiteral("slot_ms"), m_ftMode ? static_cast<int>(ft8::slot_duration(*m_ftMode).count()) : 0}});
     }
 
     void setVoiceEffectsForFt()
@@ -723,34 +779,31 @@ private:
                                   Q_ARG(quint64, m_mainSession), Q_ARG(bool, m_ftMode.has_value()));
     }
 
-    void ftReply(const QJsonObject& request, bool ok, const QString& code = {}, const QString& text = {},
-                 qint64 slot = 0)
+    void ftReply(const QJsonObject& request, bool ok, const QString& text = {})
     {
         send({{QStringLiteral("type"), QStringLiteral("ft-reply")},
               {QStringLiteral("request_id"), request.value(QStringLiteral("request_id"))},
               {QStringLiteral("ok"), ok},
-              {QStringLiteral("code"), code},
-              {QStringLiteral("text"), text},
-              {QStringLiteral("slot_utc"), slot / 1000.0}});
+              {QStringLiteral("text"), text}});
     }
 
     void selectFtMode(const QJsonObject& request)
     {
         const auto name = request.value(QStringLiteral("mode")).toString();
         const auto mode = parseFtMode(name);
-        if (mode && (!m_ftReceiver.available() || (mode != m_ftMode && (m_rxPaused || m_clientPttId || m_ftJob))))
-        {
-            ftReply(request, false, QStringLiteral("unavailable"), QStringLiteral("FT ist derzeit nicht verfügbar."));
-            return;
-        }
         if (!mode && name != QStringLiteral("off"))
         {
-            ftReply(request, false, QStringLiteral("ft_mode"), QStringLiteral("Unbekannte FT-Betriebsart."));
+            ftReply(request, false, QStringLiteral("Unbekannte FT-Betriebsart."));
             return;
         }
-        if (m_ftMode != mode)
+        if (mode != m_ftMode)
         {
-            cancelFtTx();
+            if (mode && (m_rxPaused || m_clientPttId || m_ftRadio))
+            {
+                ftReply(request, false, QStringLiteral("Betriebsart kann während TX nicht geändert werden."));
+                return;
+            }
+            stopFt();
             const bool bypassChanged = m_ftMode.has_value() != mode.has_value();
             m_ftMode = mode;
             if (bypassChanged)
@@ -759,195 +812,461 @@ private:
                 setRadioSettingsForFt();
                 sendRxFilter();
             }
-            if (m_ftMode && m_desired)
+            if (mode)
             {
-                const auto frequency = ftStandardFrequency(*m_desired, *m_ftMode);
-                if (frequency && (frequency != m_mainHz || !m_mainConfirmed))
+                m_ftPoll.start();
+                if (m_desired)
                 {
-                    tuneMain(frequency, frequency);
+                    const auto frequency = ftStandardFrequency(*m_desired, *mode);
+                    if (frequency && (frequency != m_mainHz || !m_mainConfirmed))
+                    {
+                        tuneMain(frequency, frequency);
+                    }
                 }
             }
-            m_ftReceiver.select(m_ftMode, m_mainHz);
+            else
+            {
+                m_ftPoll.stop();
+            }
             updateDemodulator(bypassChanged);
+            startFt();
         }
         sendFtState();
         ftReply(request, true);
     }
 
-    void sendFtDecode(QJsonObject message)
+    void configureFt(const QJsonObject& request)
     {
-        static const QRegularExpression cq(QStringLiteral("^CQ(?: (?:[A-Z]{1,4}|[0-9]{3}))? ([A-Z0-9/]*[0-9][A-Z0-9/]+)(?: |$)"));
-        const auto match = cq.match(message.value(QStringLiteral("message")).toString());
-        if (match.hasMatch() && message.value(QStringLiteral("message_type")).toInt() != 0)
+        if (m_ftTxAuthorized || m_ftState != ft8::State::Receiving || m_ftRadio)
         {
-            const auto call = match.captured(1);
-            message.insert(QStringLiteral("cq_call"), call);
-            if (m_ftLogbook)
-            {
-                message.insert(QStringLiteral("worked_recently"),
-                               m_ftLogbook->worked_recently(call.toStdString(), std::time(nullptr)));
-            }
-        }
-        send(message);
-    }
-
-    void logFtQso(const QJsonObject& request)
-    {
-        if (!m_ftLogbook)
-        {
-            ftReply(request, false, QStringLiteral("ft_log_disabled"));
+            ftReply(request, false, QStringLiteral("Senden vor dem Ändern der FT-Einstellungen sperren."));
             return;
         }
-        const auto text = [&request](const char* key) { return request.value(QLatin1String(key)).toString().toUpper(); };
-        const auto number = [&request](const char* key) {
-            const double value = request.value(QLatin1String(key)).toDouble();
-            return value > 0 && value < 4102444800.0 && std::floor(value) == value ? static_cast<qint64>(value) : 0;
-        };
-        static const QRegularExpression callPattern(QStringLiteral("^[A-Z0-9]{2,11}(?:/[A-Z0-9]{1,6})?$"));
-        static const QRegularExpression gridPattern(QStringLiteral("^[A-R]{2}[0-9]{2}(?:[A-X]{2})?$"));
-        static const QRegularExpression reportPattern(QStringLiteral("^[+-][0-9]{2}$"));
-        const auto call = text("call");
-        const auto own = text("own_call");
-        const auto grid = text("grid");
-        const auto ownGrid = text("own_grid");
-        const auto mode = text("mode");
-        const auto sent = text("sent_report");
-        const auto received = text("received_report");
-        const auto start = number("start");
-        const auto end = number("end");
-        const auto txHz = number("tx_hz");
-        const auto rxHz = number("rx_hz");
-        const auto& catalog = bands();
-        const auto band = std::find_if(catalog.begin(), catalog.end(), [txHz, rxHz](const Band& item) {
-            return txHz >= item.lowHz && txHz <= item.highHz && rxHz >= item.lowHz && rxHz <= item.highHz;
-        });
-        if (!parseFtMode(mode) || !callPattern.match(call).hasMatch() || !callPattern.match(own).hasMatch() ||
-            !gridPattern.match(ownGrid).hasMatch() || (!grid.isEmpty() && !gridPattern.match(grid).hasMatch()) ||
-            !reportPattern.match(sent).hasMatch() || !reportPattern.match(received).hasMatch() ||
-            !start || end < start || band == catalog.end() || band->id == QStringLiteral("cb"))
-        {
-            ftReply(request, false, QStringLiteral("ft_log_invalid"), QStringLiteral("Ungültige QSO-Daten."));
-            return;
-        }
-        std::optional<std::string> adif;
+        auto config = m_ftConfig;
+        config.callsign = request.value(QStringLiteral("callsign")).toString().trimmed().toUpper().toStdString();
+        config.locator = request.value(QStringLiteral("locator")).toString().trimmed().toUpper().toStdString();
+        config.mode = m_ftMode.value_or(ft8::Mode::FT8);
+        config.tx_hz = request.value(QStringLiteral("tx_hz")).toInt(-1);
+        const int level = request.value(QStringLiteral("tx_level")).toInt(-1);
         try
         {
-            adif = m_ftLogbook->save({call.toStdString(), own.toStdString(), grid.toStdString(), ownGrid.toStdString(),
-                mode.toStdString(), sent.toStdString(), received.toStdString(), band->id.section('-', 0, 0).toStdString(),
-                static_cast<std::time_t>(start), static_cast<std::time_t>(end),
-                static_cast<std::uint64_t>(txHz), static_cast<std::uint64_t>(rxHz)});
+            config.validate();
+            if (config.tx_hz > ftMaxTxOffset(config.mode) || level < 1 || level > 100)
+            {
+                throw std::invalid_argument("Ungültiger TX-Offset oder TX-Pegel.");
+            }
+            if (config.callsign != m_ftConfig.callsign)
+            {
+                const auto cq = ft8::encode(config.mode, "CQ " + config.callsign + " " + config.locator.substr(0, 4),
+                                            config.tx_hz, config.callsign);
+                if (cq.message.kind != ft8::Kind::CQ || cq.message.source != config.callsign)
+                {
+                    throw std::invalid_argument("Rufzeichen kann nicht in einem CQ übertragen werden.");
+                }
+            }
         }
         catch (const std::exception& error)
         {
-            qWarning("FT-Logbuch: %s", error.what());
-            ftReply(request, false, QStringLiteral("ft_log_error"));
+            ftReply(request, false, QString::fromUtf8(error.what()));
             return;
         }
-        ftReply(request, true);
-        send({{QStringLiteral("type"), QStringLiteral("ft-qso-logged")}, {QStringLiteral("call"), call}});
-        if (adif && m_qrzLogbook.enabled())
+        if (m_ft && config.callsign == m_ftConfig.callsign && config.locator == m_ftConfig.locator)
         {
-            m_qrzLogbook.insert(call, own, QByteArray::fromStdString(*adif));
+            if (config.tx_hz != ftTxOffset())
+            {
+                ft8::Command command(ft8::Command::Type::SetTxFrequency);
+                command.tx_hz = config.tx_hz;
+                if (!m_ft->command(command))
+                {
+                    ftReply(request, false, QStringLiteral("libft8 hat die Einstellung nicht angenommen."));
+                    return;
+                }
+            }
+        }
+        else
+        {
+            stopFt();
+        }
+        m_ftConfig = std::move(config);
+        m_ftLevel = level;
+        m_settings.setValue(QStringLiteral("ft/callsign"), QString::fromStdString(m_ftConfig.callsign));
+        m_settings.setValue(QStringLiteral("ft/locator"), QString::fromStdString(m_ftConfig.locator));
+        m_settings.setValue(QStringLiteral("ft/tx_hz"), m_ftConfig.tx_hz);
+        m_settings.setValue(QStringLiteral("ft/tx_level"), m_ftLevel);
+        m_settings.sync();
+        startFt();
+        sendFtState();
+        const bool saved = m_settings.status() == QSettings::NoError;
+        ftReply(request, saved, saved ? QString() : QStringLiteral("FT-Einstellungen konnten nicht gespeichert werden."));
+    }
+
+    void handleFtCommand(const QString& operation, const QJsonObject& request)
+    {
+        if (operation == QStringLiteral("ft_mode"))
+        {
+            selectFtMode(request);
+            return;
+        }
+        if (operation == QStringLiteral("ft_config"))
+        {
+            configureFt(request);
+            return;
+        }
+        if (!m_ft)
+        {
+            ftReply(request, false, QStringLiteral("FT-Empfang ist nicht bereit."));
+            return;
+        }
+
+        using Type = ft8::Command::Type;
+        const auto submit = [&](bool queued) {
+            ftReply(request, queued, queued ? QString() : QStringLiteral("libft8 hat den Befehl nicht angenommen."));
+        };
+        if (operation == QStringLiteral("ft_abort"))
+        {
+            cancelFtRadio();
+            submit(m_ft->command(ft8::Command(Type::Abort)));
+            return;
+        }
+        if (operation == QStringLiteral("ft_arm") && request.value(QStringLiteral("armed")).isBool() &&
+            !request.value(QStringLiteral("armed")).toBool())
+        {
+            submit(disarmFt());
+            sendFtState();
+            return;
+        }
+        const auto automatic = request.value(QStringLiteral("auto")).toString();
+        if (operation == QStringLiteral("ft_auto") && automatic == QStringLiteral("off"))
+        {
+            submit(m_ft->command(ft8::Command(Type::SetAuto)));
+            return;
+        }
+        if (!ftCanTransmit())
+        {
+            ftReply(request, false, QStringLiteral("TX ist belegt oder MAIN ist nicht sendebereit."));
+            return;
+        }
+        if (operation == QStringLiteral("ft_arm") && request.value(QStringLiteral("armed")).toBool())
+        {
+            const bool queued = m_ft->command(ft8::Command(Type::ArmTx));
+            m_ftTxAuthorized = m_ftTxAuthorized || queued;
+            submit(queued);
+        }
+        else if (!m_ftTxAuthorized)
+        {
+            ftReply(request, false, QStringLiteral("FT-TX zuerst freigeben."));
+        }
+        else if (operation == QStringLiteral("ft_auto") &&
+                 (automatic == QStringLiteral("call-cq") || automatic == QStringLiteral("answer-cq")))
+        {
+            ft8::Command command(Type::SetAuto);
+            command.automatic = automatic == QStringLiteral("call-cq") ? ft8::AutoMode::CallCQ : ft8::AutoMode::AnswerCQ;
+            submit(m_ft->command(command));
+        }
+        else if (operation == QStringLiteral("ft_cq") || operation == QStringLiteral("ft_start_qso"))
+        {
+            ft8::Command command(operation == QStringLiteral("ft_cq") ? Type::CallCQ : Type::StartQso);
+            const auto requestedParity = request.value(QStringLiteral("parity"));
+            if (!requestedParity.isUndefined())
+            {
+                const int parity = requestedParity.toInt(-1);
+                if (parity != 0 && parity != 1)
+                {
+                    ftReply(request, false, QStringLiteral("Ungültige Slotparität."));
+                    return;
+                }
+                command.tx_parity = parity;
+            }
+            if (command.type == Type::StartQso)
+            {
+                command.peer = request.value(QStringLiteral("peer")).toString().trimmed().toUpper().toStdString();
+                const auto id = request.value(QStringLiteral("decode_id")).toString();
+                if (!id.isEmpty())
+                {
+                    const auto selected = std::ranges::find_if(m_ftDecodes, [&](const auto& row) {
+                        return QString::number(row.first) == id;
+                    });
+                    if (selected == m_ftDecodes.end() || selected->second.message.source != command.peer)
+                    {
+                        ftReply(request, false, QStringLiteral("Decode ist veraltet oder passt nicht zum Rufzeichen."));
+                        return;
+                    }
+                    const auto age = ft8::Time::clock::now() - selected->second.slot;
+                    if (age >= ft8::Time::duration::zero() && age < 2 * ft8::slot_duration(*m_ftMode))
+                    {
+                        command.selected = selected->second;
+                    }
+                }
+            }
+            submit(m_ft->command(std::move(command)));
+        }
+        else if (operation == QStringLiteral("ft_free_text"))
+        {
+            submit(m_ft->send_free_text(request.value(QStringLiteral("text")).toString().toStdString()));
+        }
+        else
+        {
+            ftReply(request, false, QStringLiteral("Ungültiger FT-Befehl."));
         }
     }
 
-    void scheduleFtTx(const QJsonObject& request)
+    void startFt()
     {
-        if (m_ftJob || m_clientPttId || m_rxPaused || !m_txReady)
+        if (m_ft || !m_ftMode || m_mainHz <= 0 || !m_active || m_active != m_desired ||
+            m_ftConfig.callsign.empty() || m_ftConfig.locator.empty())
         {
-            ftReply(request, false, QStringLiteral("tx2_busy"), QStringLiteral("TX ist belegt oder nicht bereit."));
             return;
         }
-        const auto mode = parseFtMode(request.value(QStringLiteral("mode")).toString());
-        const auto dial = request.value(QStringLiteral("frequency_hz")).toDouble();
-        const int audioHz = request.value(QStringLiteral("audio_hz")).toInt();
-        const int level = request.value(QStringLiteral("level")).toInt();
-        const int parity = request.value(QStringLiteral("parity")).toInt(-1);
-        const auto text = request.value(QStringLiteral("message")).toString();
-        if (!mode || mode != m_ftMode || !m_mainConfirmed || dial != static_cast<double>(m_mainHz) ||
-            !m_active || m_desired != m_active || m_active->id == QStringLiteral("cb") ||
-            m_mainHz < m_active->lowHz || m_mainHz + audioHz + 70 > m_active->highHz)
+        try
         {
-            ftReply(request, false, QStringLiteral("unavailable"), QStringLiteral("Zuerst MAIN auf eine FT-Frequenz im gewählten Amateurband abstimmen."));
+            auto config = m_ftConfig;
+            config.mode = *m_ftMode;
+            config.tx_hz = ftTxOffset();
+            config.dial_frequency_hz = m_mainHz;
+            m_ft = std::make_unique<ft8::Transceiver>(std::move(config));
+        }
+        catch (const std::exception& error)
+        {
+            sendFtNotice(QStringLiteral("error"), QString::fromUtf8(error.what()));
+        }
+    }
+
+    void stopFt()
+    {
+        m_ftTxAuthorized = false;
+        cancelFtRadio();
+        if (m_ft)
+        {
+            m_ft->stop();
+            for (const auto& action : m_ft->take_radio_actions())
+            {
+                if (action.type == ft8::RadioAction::Type::Cancel)
+                {
+                    cancelFtRadio();
+                }
+            }
+            for (const auto& event : m_ft->take_events())
+            {
+                if (event.type >= ft8::Event::Type::LogSaved && event.type <= ft8::Event::Type::QrzError)
+                {
+                    handleFtEvent(event);
+                }
+            }
+            m_ft.reset();
+        }
+        m_ftDecodes.clear();
+        m_ftAudioRejected = false;
+        m_ftArmed = false;
+        m_ftAuto = ft8::AutoMode::Off;
+        m_ftState = ft8::State::Receiving;
+        m_ftPeer.clear();
+        m_ftRetries = 0;
+    }
+
+    bool disarmFt()
+    {
+        m_ftTxAuthorized = m_ftArmed = false;
+        cancelFtRadio();
+        return m_ft->command(ft8::Command(ft8::Command::Type::DisarmTx));
+    }
+
+    void cancelFtRadio()
+    {
+        if (m_ftRadio && !m_ftRadio->cancelled)
+        {
+            m_ftRadio->cancelled = true;
+            m_mainControl->cancelDigitalTx(m_ftRadio->token);
+        }
+    }
+
+    void handleFtRadio(const ft8::RadioAction& action)
+    {
+        using Type = ft8::RadioAction::Type;
+        const auto& playback = action.tx;
+        if (action.type == Type::Cancel)
+        {
+            if (m_ftRadio && m_ftRadio->id == playback.id)
+            {
+                cancelFtRadio();
+            }
             return;
         }
-        if (audioHz < 100 || audioHz > (*mode == FtMode::ft4 ? 3930 : 3950) ||
-            level < 1 || level > 100 || (parity != 0 && parity != 1) || text.size() > 37 ||
-            std::any_of(text.begin(), text.end(), [](QChar c) { return c.unicode() < 32 || c.unicode() > 126; }))
+        if (!m_ftTxAuthorized)
         {
-            ftReply(request, false, QStringLiteral("ft_tx_invalid"), QStringLiteral("FT-Nachricht, Audiofrequenz, Pegel und UTC-Slot prüfen."));
             return;
         }
-        auto pcm = encodeFtAudio(*mode, text, audioHz, level);
-        if (pcm.isEmpty())
+        if (!ftCanTransmit() || playback.mode != *m_ftMode ||
+            !std::isfinite(playback.frequency_hz) || playback.frequency_hz < 200 ||
+            playback.frequency_hz > ftMaxTxOffset(playback.mode) ||
+            m_mainHz + playback.frequency_hz + 70 > m_active->highHz)
         {
-            ftReply(request, false, text.simplified().size() > 13 ? QStringLiteral("ft8_free_text_length")
-                                                               : QStringLiteral("ft8_invalid_message"));
+            m_ft->report_radio({playback.id, ft8::RadioReport::Status::Failed, {}, "MAIN ist nicht sendebereit."});
             return;
         }
-        const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        const qint64 period = ft_slot_ms(*mode);
-        qint64 slot = now / period;
-        if (now > slot * period + 100)
-        {
-            ++slot;
-        }
-        if (slot % 2 != parity)
-        {
-            ++slot;
-        }
-        const qint64 slotMs = slot * period;
-        const quint64 id = ++m_nextFtId;
-        m_ftJob = FtJob{id, slotMs, m_mainHz, audioHz, text.simplified().toUpper()};
+        const auto token = ++m_ftNextTxToken;
+        m_ftRadio = FtRadio{token, playback.id};
         QMetaObject::invokeMethod(m_mainControl, [control = m_mainControl, session = m_mainSession,
-                                  id, hz = m_mainHz, slotMs, pcm = std::move(pcm)]() mutable {
-            control->scheduleDigitalTx(session, id, hz, slotMs + 500, std::move(pcm));
+                                  token, hz = m_mainHz, playback, level = m_ftLevel] {
+            control->scheduleDigitalTx(session, token, hz, playback, level);
         }, Qt::QueuedConnection);
-        ftReply(request, true, {}, {}, slotMs);
-        sendFtTx(QStringLiteral("scheduled"), slotMs);
+        sendFtState();
     }
 
-    void sendFtTx(const QString& phase, qint64 slotMs, const QString& result = {}, const QString& text = {})
+    void reportFtRadio(quint64 session, quint64 token, const ft8::RadioReport& report)
     {
-        QJsonObject message{{QStringLiteral("type"), QStringLiteral("ft-tx")},
-                            {QStringLiteral("phase"), phase},
-                            {QStringLiteral("slot_utc"), slotMs / 1000.0},
-                            {QStringLiteral("result"), result},
-                            {QStringLiteral("text"), text}};
-        if (result == QStringLiteral("complete") && m_ftJob)
-        {
-            message.insert(QStringLiteral("message"), m_ftJob->message);
-            message.insert(QStringLiteral("audio_hz"), m_ftJob->audioHz);
-            message.insert(QStringLiteral("dial_hz"), static_cast<double>(m_ftJob->dialHz));
-        }
-        send(message);
-    }
-
-    void updateFtTx(quint64 session, quint64 id, const QString& phase, const QString& result, const QString& text)
-    {
-        if (session != m_mainSession || !m_ftJob || m_ftJob->id != id)
+        if (session != m_mainSession || !m_ftRadio || m_ftRadio->token != token || m_ftRadio->id != report.id)
         {
             return;
         }
-        const auto slot = m_ftJob->slotMs;
-        sendFtTx(phase, slot, result, text);
-        if (phase == QStringLiteral("idle"))
+        if (m_ft && !m_ftRadio->cancelled)
         {
-            m_ftJob.reset();
+            if (!m_ft->report_radio(report))
+            {
+                disarmFt();
+            }
+            else if (report.status == ft8::RadioReport::Status::Failed)
+            {
+                m_ftTxAuthorized = m_ftArmed = false;
+            }
+        }
+        if (report.status == ft8::RadioReport::Status::Started)
+        {
+            m_ftRadio->started = !m_ftRadio->cancelled;
+        }
+        else
+        {
+            m_ftRadio.reset();
+        }
+        sendFtState();
+    }
+
+    void sendFtNotice(const QString& kind, const QString& text, const QString& peer = {},
+                      const QString& outcome = {})
+    {
+        send({{QStringLiteral("type"), QStringLiteral("ft-notice")},
+              {QStringLiteral("kind"), kind}, {QStringLiteral("text"), text},
+              {QStringLiteral("peer"), peer}, {QStringLiteral("outcome"), outcome}});
+    }
+
+    void handleFtEvent(const ft8::Event& event)
+    {
+        using Type = ft8::Event::Type;
+        switch (event.type)
+        {
+        case Type::Rx:
+        case Type::Tx:
+        {
+            const auto& message = event.rx ? event.rx->message : *event.tx;
+            const auto utc = utcMilliseconds(event.utc);
+            QJsonObject row{{QStringLiteral("type"), event.type == Type::Rx ? QStringLiteral("ft-decode") : QStringLiteral("ft-tx")},
+                            {QStringLiteral("mode"), ftModeName(event.mode)},
+                            {QStringLiteral("slot_utc_ms"), utc},
+                            {QStringLiteral("audio_hz"), event.frequency_hz},
+                            {QStringLiteral("dial_hz"), m_mainHz},
+                            {QStringLiteral("text"), QString::fromStdString(message.text)},
+                            {QStringLiteral("source"), QString::fromStdString(message.source)},
+                            {QStringLiteral("destination"), QString::fromStdString(message.destination)},
+                            {QStringLiteral("value"), QString::fromStdString(message.value)},
+                            {QStringLiteral("cq"), message.kind == ft8::Kind::CQ}};
+            if (event.rx)
+            {
+                const auto id = ++m_ftNextDecodeId;
+                m_ftDecodes.emplace_back(id, *event.rx);
+                if (m_ftDecodes.size() > 512)
+                {
+                    m_ftDecodes.pop_front();
+                }
+                row.insert(QStringLiteral("decode_id"), QString::number(id));
+                row.insert(QStringLiteral("snr_db"), event.rx->snr_db);
+                row.insert(QStringLiteral("dt_s"), event.rx->dt_seconds);
+                if (event.armed && message.destination == m_ftConfig.callsign)
+                {
+                    const auto rxSlotEnd = event.utc + ft8::slot_duration(event.mode);
+                    qInfo().noquote() << "FT-RX" << QString::fromStdString(message.source)
+                        << "slot_utc_ms=" << utc
+                        << "after_slot_end_ms=" << utcMilliseconds(ft8::Time::clock::now()) - utcMilliseconds(rxSlotEnd)
+                        << "pass=" << event.rx->pass << "AP=" << event.rx->ap
+                        << "quality=" << event.rx->quality << QString::fromStdString(message.text);
+                }
+            }
+            else if (event.audio_start)
+            {
+                const auto audioStart = utcMilliseconds(*event.audio_start);
+                row.insert(QStringLiteral("audio_start_ms"), audioStart);
+                qInfo().noquote() << "FT-TX" << "slot_utc_ms=" << utc
+                    << "audio_after_slot_start_ms=" << audioStart - utc << QString::fromStdString(message.text);
+            }
+            send(row);
+            break;
+        }
+        case Type::StateChanged:
+            m_ftState = event.state;
+            if (m_ftArmed && !event.armed)
+            {
+                m_ftTxAuthorized = false;
+            }
+            m_ftArmed = event.armed && m_ftTxAuthorized;
+            m_ftAuto = event.automatic;
+            m_ftPeer = QString::fromStdString(event.peer);
+            m_ftRetries = event.retries;
+            sendFtState();
+            break;
+        case Type::Finished:
+        case Type::FreeTextFinished:
+            sendFtNotice(event.type == Type::Finished ? QStringLiteral("qso") : QStringLiteral("free-text"),
+                         QString::fromStdString(event.detail), QString::fromStdString(event.peer),
+                         event.outcome ? ftOutcomeName(*event.outcome) : QString());
+            break;
+        case Type::LogSaved:
+        case Type::LogError:
+        case Type::QrzUploaded:
+        case Type::QrzError:
+        {
+            const bool qrz = event.type == Type::QrzUploaded || event.type == Type::QrzError;
+            const bool ok = event.type == Type::LogSaved || event.type == Type::QrzUploaded;
+            sendFtNotice(qrz ? QStringLiteral("qrz") : QStringLiteral("adif"), QString::fromStdString(event.detail),
+                         QString::fromStdString(event.peer), ok ? QStringLiteral("completed") : QStringLiteral("error"));
+            if (!ok)
+            {
+                qWarning("FT-Logbuch: %s", event.detail.c_str());
+            }
+            break;
+        }
+        case Type::CommandRejected:
+        case Type::SlotMissed:
+        case Type::Radio:
+            qInfo().noquote() << "FT" << "utc_ms=" << utcMilliseconds(event.utc)
+                << QString::fromStdString(event.detail);
+            sendFtNotice(event.type == Type::SlotMissed ? QStringLiteral("slot") : QStringLiteral("error"),
+                         QString::fromStdString(event.detail));
+            break;
         }
     }
 
-    void cancelFtTx()
+    void pollFt()
     {
-        if (m_ftJob)
+        if (m_ft)
         {
-            m_mainControl->cancelDigitalTx(m_ftJob->id);
+            for (const auto& event : m_ft->take_events())
+            {
+                handleFtEvent(event);
+            }
+            for (const auto& action : m_ft->take_radio_actions())
+            {
+                handleFtRadio(action);
+            }
+        }
+        if (std::chrono::steady_clock::now() - m_ftStateSent >= std::chrono::seconds(1))
+        {
+            sendFtState();
         }
     }
 
     void startMainControl()
     {
         m_mainControl->cancelPtt();
+        cancelFtRadio();
+        m_ftRadio.reset();
         m_clientPttId = 0;
         m_txReady = false;
         ++m_mainSession;
@@ -985,7 +1304,7 @@ private:
             if (action == QStringLiteral("start"))
             {
                 const auto mode = request.value(QStringLiteral("mode")).toString(QStringLiteral("hold"));
-                if (!m_txReady || m_rxPaused || m_clientPttId || m_ftJob)
+                if (!m_txReady || m_rxPaused || m_clientPttId || m_ftTxAuthorized || m_ftRadio)
                 {
                     return;
                 }
@@ -1094,6 +1413,10 @@ private:
             return;
         }
         m_txReady = ready && phase == QStringLiteral("rx");
+        if (m_ft && m_ftTxAuthorized && !m_txReady && !m_ftRadio)
+        {
+            disarmFt();
+        }
         if (phase == QStringLiteral("rx") || phase == QStringLiteral("offline") ||
             phase == QStringLiteral("unknown") || !ready)
         {
@@ -1140,13 +1463,23 @@ private:
 
     void setMainFrequency(qint64 hz, bool confirmed)
     {
-        m_mainConfirmed = confirmed;
-        if (hz != m_mainHz)
+        const bool frequencyChanged = hz != m_mainHz;
+        const bool confirmationChanged = confirmed != m_mainConfirmed;
+        if (frequencyChanged)
         {
-            cancelFtTx();
-            m_mainHz = hz;
-            m_ftReceiver.select(m_ftMode, hz);
-            updateDemodulator(false);
+            stopFt();
+        }
+        else if (!confirmed && m_ft && m_ftTxAuthorized)
+        {
+            disarmFt();
+        }
+        m_mainConfirmed = confirmed;
+        m_mainHz = hz;
+        if (frequencyChanged || confirmationChanged)
+        {
+            updateDemodulator(frequencyChanged);
+            startFt();
+            sendFtState();
         }
         send({{QStringLiteral("type"), QStringLiteral("main")},
               {QStringLiteral("hz"), static_cast<double>(hz)},
@@ -1174,10 +1507,6 @@ private:
             {
                 send({{QStringLiteral("type"), QStringLiteral("audio-reset")}});
             }
-        }
-        if (reset || ftReceiving != m_ftDemodulating)
-        {
-            m_ftReceiver.breakStream();
         }
         if (receiving || ftReceiving)
         {
@@ -1266,11 +1595,10 @@ private:
         m_mainConfirmed = false;
         m_streamAudio = false;
         m_mainControl->cancelPtt();
-        cancelFtTx();
-        m_ftJob.reset();
+        stopFt();
         m_ftMode.reset();
+        m_ftPoll.stop();
         setVoiceEffectsForFt();
-        m_ftReceiver.select(std::nullopt, 0);
         m_clientPttId = 0;
         m_rxPaused = m_txReady = false;
         QMetaObject::invokeMethod(m_mainControl, "stop", Qt::QueuedConnection);
@@ -1285,13 +1613,13 @@ private:
 
     void resetPi()
     {
-        if (!m_rxPaused)
-        {
-            cancelFtTx();
-        }
+        stopFt();
         m_data.clear();
         resetSpectrum();
         m_index = 0;
+        m_iqUtcSampleZero.reset();
+        m_iqTimingDisagreement.reset();
+        m_iqGap = false;
         m_header = false;
         m_active = nullptr;
         m_pending = nullptr;
@@ -1375,6 +1703,7 @@ private:
         m_samples.reserve(Spectrum::bytes);
         m_active = m_desired;
         updateDemodulator();
+        startFt();
         state(QStringLiteral("live"), QStringLiteral("Live"), m_active);
     }
 
@@ -1415,7 +1744,13 @@ private:
         m_deadline.stop();
         const Band* requested = m_pending;
         m_pending = nullptr;
-        m_center = static_cast<int>(center);
+        if (static_cast<int>(center) != m_center)
+        {
+            // Changing SUB restarts capture on the Pi and discards a settling block.
+            m_iqUtcSampleZero.reset();
+            m_iqTimingDisagreement.reset();
+            m_center = static_cast<int>(center);
+        }
         if (requested != m_desired)
         {
             tune();
@@ -1444,33 +1779,89 @@ private:
             return;
         }
 
-        int offset = 0;
-        while (m_data.size() - offset >= 12)
+        // Anchor the sample count at the end of the newest complete block in this
+        // TCP read. Older blocks in the same read already spent time in the queue.
+        const auto received = ft8::Time::clock::now();
+        const auto steady = std::chrono::steady_clock::now();
+        int completeBytes = 0;
+        auto endIndex = m_index;
+        while (m_data.size() - completeBytes >= 12)
         {
-            const auto* data = reinterpret_cast<const uchar*>(m_data.constData() + offset);
-            const auto index = qFromBigEndian<quint64>(data);
-            const auto length = qFromBigEndian<quint32>(data + 8);
-            if (index != m_index || length > maxPiBlock || length % 4 != 0)
+            const auto* frame = reinterpret_cast<const uchar*>(m_data.constData() + completeBytes);
+            const auto index = qFromBigEndian<quint64>(frame);
+            const auto length = qFromBigEndian<quint32>(frame + 8);
+            if (index != endIndex || length > maxPiBlock || length % 4 != 0)
             {
                 fault(QStringLiteral("I/Q-Rahmen des Pi ist ungültig"));
                 return;
             }
             const int payload = length == 0 ? 12 : static_cast<int>(length);
-            if (m_data.size() - offset < 12 + payload)
+            if (m_data.size() - completeBytes < 12 + payload)
             {
                 break;
             }
+            endIndex += length / 4;
+            completeBytes += 12 + payload;
+        }
+        const auto observedOrigin = ft8::sample_index(received) - static_cast<qint64>(endIndex / iqPerFtSample);
+        if (endIndex != m_index)
+        {
+            using namespace std::chrono_literals;
+            if (m_iqUtcSampleZero)
+            {
+                const auto elapsedError = (received - m_iqLastUtc) - (steady - m_iqLastSteady);
+                const auto disagreement = observedOrigin - *m_iqUtcSampleZero;
+                if (std::abs(disagreement) > ft8::sample_rate * 350 / 1000)
+                {
+                    if (!m_iqTimingDisagreement)
+                    {
+                        m_iqTimingDisagreement = steady;
+                    }
+                }
+                else
+                {
+                    m_iqTimingDisagreement.reset();
+                }
+
+                if (elapsedError < -150ms || elapsedError > 150ms ||
+                    (m_iqTimingDisagreement && steady - *m_iqTimingDisagreement >= 1s))
+                {
+                    m_iqUtcSampleZero.reset();
+                    m_iqTimingDisagreement.reset();
+                    m_iqGap = true;
+                    m_ftDecodes.clear();
+                    if (m_ft && m_ftTxAuthorized)
+                    {
+                        disarmFt();
+                        sendFtNotice(QStringLiteral("error"), QStringLiteral("UTC-Zuordnung des I/Q-Stroms wurde neu bestimmt."));
+                    }
+                }
+            }
+            m_iqLastUtc = received;
+            m_iqLastSteady = steady;
+        }
+
+        int offset = 0;
+        while (offset < completeBytes)
+        {
+            const auto* frame = reinterpret_cast<const uchar*>(m_data.constData() + offset);
+            const auto length = qFromBigEndian<quint32>(frame + 8);
+            const int payload = length == 0 ? 12 : static_cast<int>(length);
             if (length == 0)
             {
-                if (!control(data + 12))
+                if (!control(frame + 12))
                 {
                     return;
                 }
             }
             else
             {
+                if (!m_iqUtcSampleZero)
+                {
+                    m_iqUtcSampleZero = observedOrigin;
+                }
+                samples(reinterpret_cast<const char*>(frame + 12), payload, m_index);
                 m_index += length / 4;
-                samples(reinterpret_cast<const char*>(data + 12), payload);
             }
             offset += 12 + payload;
         }
@@ -1532,7 +1923,7 @@ private:
         }, Qt::QueuedConnection);
     }
 
-    void samples(const char* data, int length)
+    void samples(const char* data, int length, quint64 firstIq)
     {
         if (m_rxPaused || !m_active || !m_gui)
         {
@@ -1542,18 +1933,22 @@ private:
         if (std::all_of(data, data + length, [](char byte) { return byte == 0; }))
         {
             resetSpectrum();
-            m_ftReceiver.breakStream();
+            m_iqGap = true;
             m_demodulator.clearNotchDetection();
             publishNotchFrequency();
             return;
         }
         if (m_demodulating || m_ftDemodulating)
         {
-            const auto timestamp = QDateTime::currentMSecsSinceEpoch();
+            if (std::exchange(m_iqGap, false))
+            {
+                m_demodulator.tune(static_cast<int>(m_mainHz - m_center), m_ftMode ? Sideband::Usb : m_sideband);
+            }
+            const auto firstInput = firstIq - m_demodulator.pendingIqSamples();
             sendBrowserAudio(m_demodulator.process(data, length, m_demodulating, m_ftDemodulating));
             if (m_ftDemodulating)
             {
-                m_ftReceiver.push(m_demodulator.digitalAudio(), timestamp);
+                submitFtAudio(firstInput, m_demodulator.digitalAudio());
             }
             publishNotchFrequency();
         }
@@ -1574,21 +1969,51 @@ private:
         }
     }
 
-    QSettings m_settings;
-    struct FtJob
+    void submitFtAudio(quint64 firstIq, std::span<const float> audio)
     {
+        if (!m_ft || !m_iqUtcSampleZero || audio.empty())
+        {
+            return;
+        }
+        const auto firstAudio = *m_iqUtcSampleZero + static_cast<qint64>(firstIq / iqPerFtSample);
+        m_ftPcm.resize(audio.size());
+        std::transform(audio.begin(), audio.end(), m_ftPcm.begin(), [](float sample) {
+            return static_cast<ft8::Sample>(std::clamp(std::lround(sample * 32768), -32768L, 32767L));
+        });
+        const bool submitted = m_ft->submit_audio(firstAudio, m_ftPcm);
+        if (!submitted && !m_ftAudioRejected)
+        {
+            qWarning("FT-RX: Audioblock abgewiesen");
+        }
+        m_ftAudioRejected = !submitted;
+    }
+
+    QSettings m_settings;
+    std::unique_ptr<ft8::Transceiver> m_ft;
+    std::vector<ft8::Sample> m_ftPcm;
+    bool m_ftAudioRejected = false;
+    struct FtRadio
+    {
+        quint64 token;
         quint64 id;
-        qint64 slotMs;
-        qint64 dialHz;
-        int audioHz;
-        QString message;
+        bool started = false;
+        bool cancelled = false;
     };
-    std::optional<FtMode> m_ftMode;
-    std::optional<FtJob> m_ftJob;
-    std::unique_ptr<bridge::FtLogbook> m_ftLogbook;
-    QrzLogbook m_qrzLogbook;
-    FtReceiver m_ftReceiver;
-    quint64 m_nextFtId = 0;
+    ft8::Config m_ftConfig;
+    std::optional<ft8::Mode> m_ftMode;
+    std::optional<FtRadio> m_ftRadio;
+    QTimer m_ftPoll;
+    std::chrono::steady_clock::time_point m_ftStateSent{};
+    std::deque<std::pair<quint64, ft8::Decode>> m_ftDecodes;
+    quint64 m_ftNextDecodeId = 0;
+    quint64 m_ftNextTxToken = 0;
+    ft8::State m_ftState = ft8::State::Receiving;
+    ft8::AutoMode m_ftAuto = ft8::AutoMode::Off;
+    QString m_ftPeer;
+    unsigned m_ftRetries = 0;
+    bool m_ftArmed = false;
+    bool m_ftTxAuthorized = false;
+    int m_ftLevel = 25;
     QString m_host;
     QString m_radioAddress;
     int m_volume = 35;
@@ -1620,6 +2045,11 @@ private:
     QByteArray m_data;
     QByteArray m_samples;
     quint64 m_index = 0;
+    std::optional<qint64> m_iqUtcSampleZero;
+    bool m_iqGap = false;
+    ft8::Time m_iqLastUtc{};
+    std::chrono::steady_clock::time_point m_iqLastSteady{};
+    std::optional<std::chrono::steady_clock::time_point> m_iqTimingDisagreement;
     int m_center = 0;
     int m_rate = 0;
     qint64 m_mainHz = 0;
@@ -1649,10 +2079,22 @@ int main(int argc, char** argv)
                                        QStringLiteral("API-Key für den automatischen QRZ-Logbuch-Upload"),
                                        QStringLiteral("KEY"));
     parser.addOption(pi);
+    const QCommandLineOption ftPttLead(QStringLiteral("ft-ptt-lead-ms"),
+                                       QStringLiteral("FT-PTT-Vorlauf in Millisekunden"), QStringLiteral("MS"),
+                                       QStringLiteral("280"));
     parser.addOption(qrzApiKey);
+    parser.addOption(ftPttLead);
     parser.process(app);
 
-    Backend backend(parser.value(pi), parser.value(qrzApiKey));
+    bool validLead = false;
+    const int pttLeadMs = parser.value(ftPttLead).toInt(&validLead);
+    if (!validLead || pttLeadMs < 0 || pttLeadMs > 1000)
+    {
+        qCritical("FT-PTT-Vorlauf muss zwischen 0 und 1000 ms liegen.");
+        return 1;
+    }
+    const auto qrzKey = parser.isSet(qrzApiKey) ? parser.value(qrzApiKey) : qEnvironmentVariable("KMCONTROL_QRZ_API_KEY");
+    Backend backend(parser.value(pi), qrzKey, pttLeadMs);
     if (!backend.start())
     {
         return 1;

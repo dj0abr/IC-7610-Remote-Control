@@ -18,6 +18,7 @@ inline constexpr int maxRfPowerLevel = 255;
 inline constexpr int maxSsbIfFilterWidthCode = 0x40; // 3.6 kHz
 inline constexpr std::array<int, 2> centeredTwinPbt{128, 128};
 inline constexpr int txAudioRate = 16000;
+inline constexpr std::chrono::milliseconds txAudioBuffer{80};
 inline constexpr int txAudioBytes = txAudioRate / 50 * 2;
 inline constexpr auto txMeterTimeout = std::chrono::milliseconds(12);
 

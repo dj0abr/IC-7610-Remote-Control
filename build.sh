@@ -12,6 +12,17 @@ fi
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
+libft8_prefix=${LIBFT8_ROOT:-}
+libft8_source=${LIBFT8_SOURCE_DIR:-../../ft8/libft8}
+if [[ -n $libft8_prefix ]]; then
+    libft8_prefix=$(realpath -- "$libft8_prefix")
+elif [[ -f $libft8_source/include/libft8/libft8.hpp ]]; then
+    libft8_source=$(realpath -- "$libft8_source")
+else
+    printf '%s\n' 'Setze LIBFT8_SOURCE_DIR auf das libft8-Projekt oder LIBFT8_ROOT auf die installierte libft8 ab Version 0.2.' >&2
+    exit 1
+fi
+
 # Prefer the source address of the default IPv4 route without sending packets.
 pi_ip=$(ip -4 route get 1.1.1.1 2>/dev/null |
     awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)
@@ -29,7 +40,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 
 sudo apt update
 sudo apt install -y ca-certificates curl build-essential cmake gfortran pkg-config \
-    qtbase5-dev libboost-dev libfftw3-dev libliquid-dev libspeexdsp-dev
+    qtbase5-dev libboost-dev libfftw3-dev libliquid-dev libspeexdsp-dev \
+    libcurl4-openssl-dev nlohmann-json3-dev
 
 driver_dir=raspberry/ftdi
 if [[ ! -s $driver_dir/ftd3xx.h || ! -s $driver_dir/Types.h || ! -s $driver_dir/libftd3xx.so ]]; then
@@ -42,10 +54,17 @@ if [[ ! -s $driver_dir/ftd3xx.h || ! -s $driver_dir/Types.h || ! -s $driver_dir/
     install -m 0644 "$work_dir/linux-arm-v8/"{ftd3xx.h,Types.h,libftd3xx.so} "$driver_dir/"
 fi
 
-printf '%s\n' 'Baue I/Q-Bridge, Backend, Webserver und FT4/FT8-Decoder ...'
+if [[ -z $libft8_prefix ]]; then
+    libft8_prefix=$work_dir/libft8-install
+    cmake -S "$libft8_source" -B "$work_dir/libft8-build" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+    cmake --build "$work_dir/libft8-build" --parallel 2
+    cmake --install "$work_dir/libft8-build" --prefix "$libft8_prefix"
+fi
+
+printf '%s\n' 'Baue I/Q-Bridge, Backend und Webserver ...'
 make -C raspberry
 cmake -S controller -B controller/build -DCMAKE_BUILD_TYPE=Release \
-    -DLIQUID_ROOT=/usr -DBUILD_TESTING=OFF
+    -DLIQUID_ROOT=/usr -Dlibft8_ROOT="$libft8_prefix"
 cmake --build controller/build --parallel 2
 
 credentials=/etc/kmcontrol/icom.env
@@ -80,7 +99,8 @@ fi
 printf '%s\n' 'Richte den Autostart ein ...'
 install_dir=/usr/local/lib/kmcontrol
 sudo install -d -m 0755 "$install_dir/ftdi"
-sudo install -m 0755 raspberry/iq-test controller/build/{kmcontrol-backend,kmcontrol-web,ft8-decoder} "$install_dir/"
+sudo install -m 0755 raspberry/iq-test "$install_dir/"
+sudo cmake --install controller/build --prefix "$install_dir"
 sudo install -m 0644 "$driver_dir/libftd3xx.so" "$install_dir/ftdi/"
 
 sudo groupadd -f plugdev

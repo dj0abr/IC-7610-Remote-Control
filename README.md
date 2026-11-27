@@ -32,11 +32,11 @@ sudo apt install -y git
 git clone https://github.com/dj0abr/IC-7610-Remote-Control.git "$HOME/kmcontrol"
 ```
 
-Jetzt starten wir die vollautomatische Installation.
+Für FT4/FT8 braucht das Backend zusätzlich libft8 ab Version 0.2. Kopiere den libft8-Quellbaum auf den Pi, zum Beispiel nach `~/libft8`. Das Installationsskript baut die Library mit. Für eine bereits installierte ARM64-Version kann alternativ `LIBFT8_ROOT` auf deren Installationspräfix zeigen.
 
 ```bash
 cd "$HOME/kmcontrol"
-./build.sh
+LIBFT8_SOURCE_DIR="$HOME/libft8" ./build.sh
 ```
 
 Fehlen die Netzwerk-Anmeldedaten des IC-7610, fragt das Skript danach. Die IP des Pi erkennt es selbst. Am Ende zeigt es die Webadresse an.

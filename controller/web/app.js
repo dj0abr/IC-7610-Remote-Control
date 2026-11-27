@@ -128,8 +128,7 @@ const ft = createFtPanel({send, preferences, savePreferences});
 
 function updateFt() {
   ft.update({connected: socket?.readyState === WebSocket.OPEN, band: activeBand, dial: mainHz,
-    confirmed: mainConfirmed, txReady: tx.ready && tx.phase === 'rx',
-    paused: receivePaused(), voiceBusy: !!pttId, live: spectrumLive});
+    paused: receivePaused(), voiceBusy: !!pttId});
 }
 
 function savePreferences() {
@@ -900,18 +899,13 @@ function control(message) {
       break;
     case 'ft-state':
       ft.handle(message);
-      renderRadioOptions();
+      renderTx();
       break;
     case 'ft-reply':
     case 'ft-tx':
     case 'ft-decode':
-    case 'ft-error':
-    case 'ft-qso-logged':
-    case 'ft-qrz-status':
+    case 'ft-notice':
       ft.handle(message);
-      if (message.type === 'ft-tx') {
-        renderTx();
-      }
       break;
     case 'main-status':
       element('main-frequency').title = message.text;

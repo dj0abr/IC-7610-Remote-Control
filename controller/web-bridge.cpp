@@ -113,8 +113,9 @@ bool isCommand(const QJsonObject& object)
         op == QStringLiteral("volume") || op == QStringLiteral("audio_output") || op == QStringLiteral("rx_filter") ||
         op == QStringLiteral("ptt") || op == QStringLiteral("rf_power") ||
         op == QStringLiteral("compressor") || op == QStringLiteral("preamp") ||
-        op == QStringLiteral("ft_mode") || op == QStringLiteral("ft8_tx_start") ||
-        op == QStringLiteral("ft8_tx_stop") || op == QStringLiteral("ft_qso_log");
+        op == QStringLiteral("ft_mode") || op == QStringLiteral("ft_config") ||
+        op == QStringLiteral("ft_arm") || op == QStringLiteral("ft_auto") || op == QStringLiteral("ft_cq") ||
+        op == QStringLiteral("ft_start_qso") || op == QStringLiteral("ft_abort") || op == QStringLiteral("ft_free_text");
 }
 
 class BrowserSession : public std::enable_shared_from_this<BrowserSession>
@@ -415,7 +416,6 @@ constexpr Asset assets[] = {
     {"/tx-audio.js", ":/web/tx-audio.js", "text/javascript; charset=utf-8"},
     {"/tx-worklet.js", ":/web/tx-worklet.js", "text/javascript; charset=utf-8"},
     {"/ft-panel.js", ":/web/ft-panel.js", "text/javascript; charset=utf-8"},
-    {"/ft-qso.js", ":/web/ft-qso.js", "text/javascript; charset=utf-8"},
     {"/dxcc.js", ":/web/dxcc.js", "text/javascript; charset=utf-8"},
     {"/dxcc-data.js", ":/web/dxcc-data.js", "text/javascript; charset=utf-8"},
     {"/dxcc-flags.png", ":/web/dxcc-flags.png", "image/png"},

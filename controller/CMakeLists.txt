@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(kmcontrol LANGUAGES CXX Fortran)
+project(kmcontrol LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,21 +40,21 @@ endif()
 add_library(icom-lan STATIC icom-lan.cpp)
 target_compile_options(icom-lan PRIVATE -Wall -Wextra -Wpedantic)
 
+find_package(libft8 0.2 CONFIG REQUIRED HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../ft8/libft8/build/install")
 add_executable(kmcontrol-backend backend.cpp main-control.cpp spectrum.cpp ssb-demod.cpp
-    rx-audio-filter.cpp rx-notch.cpp ft-receive.cpp ft-transmit.cpp ft_logbook.cpp qrz-logbook.cpp)
-target_link_libraries(kmcontrol-backend PRIVATE Qt5::Core Qt5::Network PkgConfig::FFTW LiquidDSP ${SPEEXDSP_TARGET} icom-lan)
+    rx-audio-filter.cpp rx-notch.cpp)
+target_link_libraries(kmcontrol-backend PRIVATE Qt5::Core Qt5::Network PkgConfig::FFTW LiquidDSP
+    ${SPEEXDSP_TARGET} icom-lan libft8::libft8)
 target_compile_options(kmcontrol-backend PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(kmcontrol-backend PROPERTIES INSTALL_RPATH "$ORIGIN")
 
 find_package(Boost 1.74 REQUIRED)
 find_package(Threads REQUIRED)
-
-add_subdirectory(external/ft8)
-set_target_properties(ft8-decoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-add_dependencies(kmcontrol-backend ft8-decoder)
-target_link_libraries(kmcontrol-backend PRIVATE ft8_core)
-target_include_directories(kmcontrol-backend PRIVATE external/ft8/src)
 
 add_executable(kmcontrol-web web-bridge.cpp web.qrc)
 target_link_libraries(kmcontrol-web PRIVATE Qt5::Core Boost::boost Threads::Threads)
 target_compile_definitions(kmcontrol-web PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
 target_compile_options(kmcontrol-web PRIVATE -Wall -Wextra -Wpedantic)
+
+install(TARGETS kmcontrol-backend kmcontrol-web RUNTIME DESTINATION .)
+install(FILES "$<TARGET_FILE:libft8::libft8>" "$<TARGET_SONAME_FILE:libft8::libft8>" DESTINATION .)

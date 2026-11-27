@@ -209,16 +209,19 @@
                 <progress id="ft-slot-progress" value="0" max="15" aria-label="Fortschritt im UTC-Slot"></progress>
               </div>
             </div>
-            <label><span>Betriebsart</span>
-              <select id="ft-mode" disabled><option value="FT4">FT4</option><option value="FT8" selected>FT8</option></select>
-            </label>
+            <div class="ft-mode-options">
+              <label><input id="ft-cq-only" type="checkbox" aria-controls="ft8-log"> CQ-only</label>
+              <label><span>Betriebsart</span>
+                <select id="ft-mode" disabled><option value="FT4">FT4</option><option value="FT8" selected>FT8</option></select>
+              </label>
+            </div>
           </header>
           <div class="ft-receive">
             <div class="ft-logs">
               <div class="ft-log-pane">
                 <div id="ft8-log" class="decoder-text" role="log" aria-live="polite" aria-label="Alle FT4/8-Nachrichten" tabindex="0"></div>
-                <button type="button" class="ft-log-end" aria-controls="ft8-log" aria-label="Zum Ende aller Nachrichten"
-                  title="Zum Ende aller Nachrichten">↓</button>
+                <button type="button" class="ft-log-end" aria-controls="ft8-log" aria-label="Zum Ende der oberen Nachrichtenliste"
+                  title="Zum Ende der oberen Nachrichtenliste">↓</button>
               </div>
               <div class="ft-log-pane ft-own-messages">
                 <div id="ft8-own-label" class="ft-log-heading">Nachrichten mit eigenem Rufzeichen</div>
@@ -234,52 +237,48 @@
             </div>
           </div>
           <div class="ft-controls">
-            <div class="ft-qso">
+            <form id="ft-settings" class="ft-qso">
               <label><span>Eigenes Rufzeichen</span>
-                <input id="ft-own-call" maxlength="6" spellcheck="false" autocomplete="off">
+                <input id="ft-own-call" minlength="3" maxlength="11" spellcheck="false" autocomplete="off" required>
               </label>
-              <label><span>QTH-Locator</span><input id="ft-own-grid" maxlength="6" spellcheck="false" autocomplete="off"></label>
+              <label><span>QTH-Locator</span>
+                <input id="ft-own-grid" minlength="4" maxlength="6" spellcheck="false" autocomplete="off" required>
+              </label>
+              <label><span>Audio (Hz)</span>
+                <input id="ft8-audio-hz" type="number" min="200" max="3950" value="1500" required>
+              </label>
+              <label><span>TX-Pegel (%)</span>
+                <input id="ft8-level" type="number" min="1" max="100" value="25" required>
+              </label>
+              <button id="ft-save" type="submit" class="small-button">Einstellungen speichern</button>
+            </form>
+            <div class="ft-qso">
+              <label class="ft-arm"><input id="ft-arm" type="checkbox" autocomplete="off"> FT-TX freigeben</label>
+              <label><span>Auto-Mode</span>
+                <select id="ft-auto" disabled>
+                  <option value="off">Aus</option><option value="call-cq">CQ rufen</option>
+                  <option value="answer-cq">CQ und Direktanrufe beantworten</option>
+                </select>
+              </label>
+              <label><span>UTC-Slot für CQ</span>
+                <select id="ft8-parity"><option value="auto">Automatisch</option></select>
+              </label>
               <button id="ft-cq" type="button" class="small-button" disabled>CQ rufen</button>
-              <label class="ft-auto"><input id="ft-auto" type="checkbox" checked>
-                <span>Auto-QSO</span>
-              </label>
-              <label class="ft-auto"><input id="ft-auto-reply" type="checkbox">
-                <span>Auto-Antwort</span>
-              </label>
-              <label class="ft-auto"><input id="ft-auto-cq" type="checkbox" autocomplete="off">
-                <span>Auto-CQ</span>
-              </label>
-              <label class="ft-auto"><input id="ft-auto-cq-reply" type="checkbox" autocomplete="off">
-                <span>Auto-CQ-Antwort</span>
-              </label>
+              <button id="ft8-stop" type="button" class="small-button" disabled>Abbrechen</button>
             </div>
             <form id="ft8-tx-form">
-              <label class="ft8-message"><span>TX-Nachricht</span>
-                <input id="ft8-message" type="text" maxlength="37" aria-describedby="ft8-status" autocomplete="off" spellcheck="false" required>
+              <label class="ft8-message"><span>Freitext</span>
+                <input id="ft8-message" type="text" maxlength="13" aria-describedby="ft8-status"
+                  autocomplete="off" spellcheck="false" required>
               </label>
-              <div class="ft-tx-settings">
-                <label><span>Audio (Hz)</span>
-                  <input id="ft8-audio-hz" type="number" min="100" max="3950" value="1500" required>
-                </label>
-                <label><span>TX-Pegel (%)</span>
-                  <input id="ft8-level" type="number" min="1" max="100" value="25" required>
-                </label>
-                <label><span>UTC-Slot</span>
-                  <select id="ft8-parity"><option value="0">:00 / :30</option><option value="1">:15 / :45</option></select>
-                </label>
-              </div>
-              <div class="ft-tx-actions">
-                <button id="ft8-send" class="small-button" type="submit" disabled>Einmal senden</button>
-                <button id="ft8-stop" class="small-button" type="button" disabled>Abbrechen</button>
-              </div>
+              <button id="ft8-send" class="small-button" type="submit" disabled>Einmal senden</button>
             </form>
             <div class="ft-status-bar">
               <div id="ft-contact" class="ft-contact" hidden>
                 <output id="ft-qso-status" aria-live="polite"></output>
-                <button id="ft-apply-reply" type="button" class="small-button" hidden>Vorschlag übernehmen</button>
-                <button id="ft-end-qso" type="button" class="small-button">QSO beenden</button>
               </div>
               <p id="ft8-status" role="status"></p>
+              <p id="ft-adif-status" role="status"></p>
               <p id="ft-qrz-status" role="status"></p>
             </div>
           </div>

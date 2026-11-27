@@ -2,6 +2,9 @@
 
 #include "icom-lan.hpp"
 
+#include <libft8/libft8.hpp>
+#include <QMetaType>
+
 #include <QByteArray>
 #include <QElapsedTimer>
 #include <QObject>
@@ -13,6 +16,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+
+Q_DECLARE_METATYPE(ft8::RadioReport)
 
 class MainControl : public QObject
 {
@@ -26,7 +31,7 @@ public:
     void pttInput(quint64 session, quint32 id, const QString& action, bool latched);
     void txAudioInput(quint64 session, quint32 id, QByteArray pcm);
     void cancelPtt();
-    void scheduleDigitalTx(quint64 session, quint64 id, qint64 dialHz, qint64 audioUtcMs, QByteArray pcm);
+    void scheduleDigitalTx(quint64 session, quint64 token, qint64 dialHz, ft8::Playback playback, int level);
     void cancelDigitalTx(quint64 id) { m_cancelDigitalId.store(id); }
 
 public slots:
@@ -46,8 +51,7 @@ signals:
     void rxMeterChanged(quint64 session, int level);
     void txMetersChanged(quint64 session, int power, int swr);
     void txChanged(quint64 session, const QString& phase, bool ready, const QString& text);
-    void digitalTxChanged(quint64 session, quint64 id, const QString& phase,
-                          const QString& result, const QString& text);
+    void digitalTxReported(quint64 session, quint64 token, const ft8::RadioReport& report);
 
 private:
     struct TuneRequest
@@ -79,16 +83,18 @@ private:
 
     struct DigitalTx
     {
-        quint64 id;
+        quint64 token;
         qint64 dialHz;
-        qint64 audioUtcMs;
-        Clock::time_point audioAt;
+        ft8::Playback playback;
+        Clock::time_point packetAt;
+        Clock::time_point deadline;
         QByteArray pcm;
         int position = 0;
         bool keyed = false;
+        bool started = false;
     };
     bool processDigitalTx(Clock::time_point now, bool settingWritePending);
-    void finishDigitalTx(const QString& result, const QString& text = {});
+    void finishDigitalTx(ft8::RadioReport::Status status, std::string detail = {});
 
     struct PttRequest
     {

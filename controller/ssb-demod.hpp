@@ -36,6 +36,7 @@ public:
     void setNoiseReduction(int percent);
     std::span<const float> process(const char* data, int bytes, bool voice = true, bool digital = false);
     std::span<const float> digitalAudio() const { return m_digitalAudio; }
+    std::size_t pendingIqSamples() const { return m_iq.size(); }
 
 private:
     float detectAudio(const std::complex<float>& sample);
