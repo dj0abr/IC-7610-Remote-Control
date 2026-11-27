@@ -1,3 +1,5 @@
+import {language, translate} from '/i18n.js';
+
 const rowCount = 250;
 const averageCount = 8;
 export const minimumLevel = -1600;
@@ -9,9 +11,10 @@ const palettes = {
   green: ['#0a1520', '#124033', '#208358', '#43c984', '#c2ffcf'],
 };
 const levelPowers = Float64Array.from({length: 1601}, (_, i) => 10 ** ((i + minimumLevel) / 100));
-const mhzFormat = [3, 6].map(digits => new Intl.NumberFormat('de-DE', {
-  minimumFractionDigits: digits, maximumFractionDigits: digits, useGrouping: false,
-}));
+const mhzFormat = Object.fromEntries(['de', 'en'].map(lang =>
+  [lang, [3, 6].map(digits => new Intl.NumberFormat(lang, {
+    minimumFractionDigits: digits, maximumFractionDigits: digits, useGrouping: false,
+  }))]));
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -154,6 +157,11 @@ export class PlotPair {
     this.schedule();
   }
 
+  languageChanged() {
+    this.overlayDirty = true;
+    this.schedule();
+  }
+
   passband(ctx, area) {
     if (!this.zoom || !this.bounds || !this.passbandHigh) {
       return;
@@ -256,7 +264,7 @@ export class PlotPair {
       return;
     }
     const ticks = this.frequencyTicks(area);
-    const format = mhzFormat[Number(this.zoom)];
+    const format = mhzFormat[language][Number(this.zoom)];
     ctx.font = '11px system-ui';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#a1b6c9';
@@ -386,7 +394,7 @@ export class PlotPair {
       ctx.fillStyle = '#a1b6c9';
       ctx.font = '12px system-ui';
       ctx.textAlign = 'center';
-      ctx.fillText(this.zoom ? 'Warte auf I/Q-Daten um MAIN' : 'Warte auf Spektrum',
+      ctx.fillText(translate(this.zoom ? 'Warte auf I/Q-Daten um MAIN' : 'Warte auf Spektrum'),
         area.left + area.width / 2, area.top + area.height / 2);
     }
     this.marker(ctx, area);

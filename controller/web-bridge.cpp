@@ -416,6 +416,7 @@ constexpr Asset assets[] = {
     {"/index.html", ":/web/index.html", "text/html; charset=utf-8"},
     {"/style.css", ":/web/style.css", "text/css; charset=utf-8"},
     {"/app.js", ":/web/app.js", "text/javascript; charset=utf-8"},
+    {"/i18n.js", ":/web/i18n.js", "text/javascript; charset=utf-8"},
     {"/plots.js", ":/web/plots.js", "text/javascript; charset=utf-8"},
     {"/audio.js", ":/web/audio.js", "text/javascript; charset=utf-8"},
     {"/tx-audio.js", ":/web/tx-audio.js", "text/javascript; charset=utf-8"},
@@ -495,7 +496,7 @@ private:
         }
         if (path == "/ft4-ft8.adi")
         {
-            downloadAdif();
+            downloadAdif(std::string_view(target).substr(path.size()) == "?lang=en");
             return;
         }
         for (const auto& asset : assets)
@@ -514,17 +515,17 @@ private:
         respond(http::status::not_found, "text/plain; charset=utf-8", "Datei nicht gefunden.");
     }
 
-    void downloadAdif()
+    void downloadAdif(bool english)
     {
         constexpr auto text = "text/plain; charset=utf-8";
-        constexpr auto readError = "ADIF-Logbuch kann nicht gelesen werden.";
+        const auto readError = english ? "The ADIF logbook cannot be read." : "ADIF-Logbuch kann nicht gelesen werden.";
         const auto path = QFile::encodeName(ftAdifPath());
         const int fd = ::open(path.constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0)
         {
             const bool missing = errno == ENOENT;
-            respond(missing ? http::status::not_found : http::status::internal_server_error, text,
-                    missing ? "ADIF-Logbuch ist noch nicht vorhanden." : readError);
+            const auto missingError = english ? "The ADIF logbook does not exist yet." : "ADIF-Logbuch ist noch nicht vorhanden.";
+            respond(missing ? http::status::not_found : http::status::internal_server_error, text, missing ? missingError : readError);
             return;
         }
         beast::file_posix file;
@@ -540,8 +541,9 @@ private:
         if (::flock(fd, LOCK_SH | LOCK_NB) != 0)
         {
             const bool busy = errno == EWOULDBLOCK;
-            respond(busy ? http::status::service_unavailable : http::status::internal_server_error, text,
-                    busy ? "ADIF-Logbuch wird gerade geschrieben. Bitte erneut versuchen." : readError);
+            const auto busyError = english ? "The ADIF logbook is being written. Please try again."
+                                           : "ADIF-Logbuch wird gerade geschrieben. Bitte erneut versuchen.";
+            respond(busy ? http::status::service_unavailable : http::status::internal_server_error, text, busy ? busyError : readError);
             return;
         }
         // Capture the committed length, then let the logbook append while we send that snapshot.

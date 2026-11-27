@@ -2,6 +2,7 @@ import {BrowserAudio, grantMicrophoneAccess} from '/audio.js';
 import {PlotPair} from '/plots.js';
 import {Microphone} from '/tx-audio.js';
 import {createFtPanel} from '/ft-panel.js';
+import {language, locale, setLanguage, setMessage, translate} from '/i18n.js';
 
 const element = id => document.getElementById(id);
 const bandSelect = element('band');
@@ -25,6 +26,7 @@ const radioOptions = {
   preamp: {select: element('preamp'), error: element('preamp-error'), value: null, max: 2},
 };
 const setup = element('setup');
+const languageSelect = element('language');
 const addresses = ['radio-ip', 'pi-ip'].map(id => ({
   key: id.replace('-', '_'), input: element(id), error: element(`${id}-error`), pending: null,
 }));
@@ -43,7 +45,7 @@ const txPower = element('tx-output-power');
 const txSwr = element('tx-swr');
 const txPowerBar = element('tx-power-bar');
 const txSwrBar = element('tx-swr-bar');
-const txMeterFormat = new Intl.NumberFormat('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1});
+let txMeterFormat, frequencyFormat, rangeFormat;
 const txError = element('tx-error');
 const browserSpeaker = element('browser-speaker');
 const browserMicrophone = element('browser-microphone');
@@ -56,10 +58,6 @@ const lowerControl = element('lower');
 const upperControl = element('upper');
 const colorControl = element('color');
 const supportedColors = ['blue', 'red', 'green'];
-const frequencyFormat = new Intl.NumberFormat('de-DE', {
-  minimumFractionDigits: 6, maximumFractionDigits: 6, useGrouping: false,
-});
-const rangeFormat = new Intl.NumberFormat('de-DE', {maximumFractionDigits: 5, useGrouping: false});
 const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 const bandDecoder = new TextDecoder();
 const headerBytes = 28;
@@ -110,6 +108,7 @@ let browserDevices = [];
 let deviceRefresh = 0;
 let requestingDevices = false;
 let tx = {phase: 'offline', ready: false};
+let txMeterReadings;
 let micStart = null;
 let microphoneError = '';
 let pttId = 0;
@@ -140,7 +139,7 @@ function savePreferences() {
 }
 
 function setStatus(text, phase = '') {
-  status.value = text;
+  setMessage(status, text, 'value');
   status.dataset.phase = phase;
 }
 
@@ -169,7 +168,7 @@ function receivePaused() {
 }
 
 function showTxError(text) {
-  txError.value = text;
+  setMessage(txError, text, 'value');
   txError.hidden = !text;
 }
 
@@ -189,11 +188,11 @@ function renderTx() {
   renderRadioOptions();
   pttButton.disabled = !pttId && !canStartPtt();
   pttButton.setAttribute('aria-pressed', String(!!pttId));
-  pttHint.textContent = pttMode === 'toggle' ? 'Rasten · Leertaste' : 'Halten · Leertaste';
+  pttHint.textContent = translate(pttMode === 'toggle' ? 'Rasten · Leertaste' : 'Halten · Leertaste');
   txIndicator.dataset.phase = tx.phase;
-  txIndicator.value = ({
+  txIndicator.value = translate(({
     rx: 'RX', starting: 'TX startet …', tx: 'TX', ending: 'RX wird geprüft …', unknown: 'RX prüfen',
-  })[tx.phase] || '';
+  })[tx.phase]);
   bandSelect.disabled = !bands.length || !activeBand || receivePaused() || !!pttId;
   renderDeviceControls();
 }
@@ -280,7 +279,8 @@ async function startMicrophone() {
     } else if (error.name === 'NotAllowedError') {
       setMicrophoneError('Der Browser hat den Mikrofonzugriff blockiert. PTT ist deaktiviert.');
     } else {
-      setMicrophoneError(error.message || 'Mikrofon konnte nicht geöffnet werden.');
+      setMicrophoneError(error instanceof DOMException || !error.message
+        ? 'Mikrofon konnte nicht geöffnet werden.' : error.message);
     }
   } finally {
     if (request === micStart) {
@@ -324,7 +324,9 @@ function renderRxMeter(level = null) {
     `S9 +${aboveS9} dB`;
 }
 
-function renderTxMeters({po = null, swr = null} = {}) {
+function renderTxMeters(message) {
+  txMeterReadings = message;
+  const {po = null, swr = null} = message ?? {};
   // CI-V reports positions on the Icom's meter scales (reference, commands 15 11 and 15 12).
   const watts = po === null ? null : meterValue(po, [[0, 0], [143, 50], [212, 100]]);
   const ratio = swr === null ? null : meterValue(swr, [[0, 1], [48, 1.5], [80, 2], [120, 3]]);
@@ -432,7 +434,7 @@ function renderRfPower() {
 
 function updateRfPower(percent, text = '') {
   confirmedPower = Number.isInteger(percent) && percent >= 0 && percent <= 100 ? percent : null;
-  rfPowerError.value = text;
+  setMessage(rfPowerError, text, 'value');
   rfPowerError.hidden = !text;
   renderRfPower();
 }
@@ -447,7 +449,7 @@ function renderRadioOptions() {
 
 function updateRadioOption(option, value, text = '') {
   option.value = Number.isInteger(value) && value >= 0 && value <= option.max ? value : null;
-  option.error.textContent = text;
+  setMessage(option.error, text);
   option.error.hidden = !text;
   renderRadioOptions();
 }
@@ -469,17 +471,17 @@ function renderNotch() {
   notchAuto.hidden = mode !== 'auto';
   if (!notchManual.hidden) {
     notchFrequency.value = rxFilter.notch_hz;
-    element('notch-hz-value').value = `${rxFilter.notch_hz.toLocaleString('de-DE')} Hz`;
+    element('notch-hz-value').value = `${rxFilter.notch_hz.toLocaleString(locale)} Hz`;
     paintFilterRange(notchFrequency);
   }
-  notchDetected.value = !audioEnabled ? 'Audio aus' :
-    detectedNotchHz == null ? '—' : `${detectedNotchHz.toLocaleString('de-DE')} Hz`;
+  notchDetected.value = !audioEnabled ? translate('Audio aus') :
+    detectedNotchHz == null ? '—' : `${detectedNotchHz.toLocaleString(locale)} Hz`;
 }
 
 function renderFilter() {
   renderNotch();
   const sideband = rxFilter?.ft_bypass ? 'USB' : modeSelect.value;
-  element('filter-mode').textContent = sideband ? `MAIN · ${sideband}-Filter` : 'MAIN · RX-Filter';
+  element('filter-mode').textContent = sideband ? translate('MAIN · {sideband}-Filter', {sideband}) : translate('MAIN · RX-Filter');
   for (const control of [filterLower, filterUpper, ...filterPresets]) {
     control.disabled = !rxFilter;
   }
@@ -492,8 +494,9 @@ function renderFilter() {
   }
 
   const {low_hz: low, high_hz: high, nr_percent: noise} = rxFilter;
-  const lowLabel = `${low.toLocaleString('de-DE')} Hz`;
-  const highLabel = `${high.toLocaleString('de-DE')} Hz`;
+  const lowNumber = low.toLocaleString(locale);
+  const lowLabel = `${lowNumber} Hz`;
+  const highLabel = `${high.toLocaleString(locale)} Hz`;
   filterLower.max = high - 500;
   filterUpper.min = low + 500;
   filterLower.value = low;
@@ -510,7 +513,7 @@ function renderFilter() {
   for (const button of filterPresets) {
     button.setAttribute('aria-pressed', String(Number(button.dataset.bandwidth) === high - low));
   }
-  zoomLabel.textContent = `${sideband} · ${low.toLocaleString('de-DE')}–${highLabel}`;
+  zoomLabel.textContent = `${sideband} · ${lowNumber}–${highLabel}`;
   zoom.setPassband(sideband === 'LSB' ? -high : sideband === 'USB' ? low : 0,
     sideband === 'LSB' ? -low : sideband === 'USB' ? high : 0);
 }
@@ -541,20 +544,20 @@ function installFilter(message) {
   const {low_hz, high_hz, nr_percent, notch_mode, notch_hz, notch_detected_hz, ft_bypass} = message;
   rxFilter = {low_hz, high_hz, nr_percent, notch_mode, notch_hz, ft_bypass: ft_bypass === true};
   detectedNotchHz = notch_detected_hz;
-  filterError.textContent = message.text;
+  setMessage(filterError, message.text);
   filterError.hidden = !message.text;
   renderFilter();
 }
 
 function showAudioError(text) {
-  audioError.textContent = text;
+  setMessage(audioError, text);
   audioError.hidden = !text;
 }
 
 function renderAudioButton() {
   renderNotch();
   audioButton.disabled = audioStarting || !setupState || (requestingDevices && !audioEnabled);
-  audioButton.textContent = audioStarting ? 'Audio startet …' : audioEnabled ? 'Audio ausschalten' : 'Audio einschalten';
+  audioButton.textContent = translate(audioStarting ? 'Audio startet …' : audioEnabled ? 'Audio ausschalten' : 'Audio einschalten');
   audioButton.setAttribute('aria-pressed', String(audioEnabled));
 }
 
@@ -618,7 +621,8 @@ async function toggleAudio() {
     audioEnabled = true;
   } catch (error) {
     disableAudio();
-    showAudioError(error.message || 'Audio konnte nicht gestartet werden.');
+    showAudioError(error instanceof DOMException || !error.message
+      ? 'Audio konnte nicht gestartet werden.' : error.message);
   } finally {
     audioStarting = false;
     renderTx();
@@ -643,15 +647,21 @@ function selectBand(id) {
   restoreBandThresholds(id);
   spectrumLive = false;
   updateFt();
+  renderBandRange();
+  audio.reset();
+  setStatus('Band wird eingestellt …', 'connecting');
+  send({op: 'band', id});
+}
+
+function renderBandRange() {
+  if (!activeBand) return;
+  const band = activeBand;
   const low = rangeFormat.format(band.low_hz / 1e6);
   const high = rangeFormat.format(band.high_hz / 1e6);
   const center = rangeFormat.format(band.center_hz / 1e6);
   element('band-range').value = `${low}–${high} MHz`;
   element('sub-frequency').value = `${center} MHz`;
-  element('fullband-range').textContent = `${(band.display_high_hz - band.display_low_hz) / 1000} kHz`;
-  audio.reset();
-  setStatus('Band wird eingestellt …', 'connecting');
-  send({op: 'band', id});
+  element('fullband-range').textContent = `${rangeFormat.format((band.display_high_hz - band.display_low_hz) / 1000)} kHz`;
 }
 
 function installBands(message) {
@@ -661,7 +671,7 @@ function installBands(message) {
   }
   bands = message.bands;
   halfSpan = message.zoom_half_span_hz || 30000;
-  element('zoom-range').textContent = `MAIN ±${halfSpan / 1000} kHz`;
+  element('zoom-range').textContent = `MAIN ±${rangeFormat.format(halfSpan / 1000)} kHz`;
   zoom.setMain(mainHz, halfSpan);
   bandSelect.replaceChildren(...bands.map(band => new Option(band.label, band.id)));
   bandSelect.disabled = false;
@@ -671,12 +681,12 @@ function installBands(message) {
 }
 
 function fillDeviceSelect(select, selected, devices) {
-  select.replaceChildren(new Option('Systemstandard', ''));
+  select.replaceChildren(new Option(translate('Systemstandard'), ''));
   for (const device of devices) {
     select.add(new Option(device.label, device.deviceId));
   }
   if (selected && !devices.some(device => device.deviceId === selected)) {
-    select.add(new Option('Gespeichertes Gerät (nicht verfügbar)', selected));
+    select.add(new Option(translate('Gespeichertes Gerät (nicht verfügbar)'), selected));
   }
   select.value = selected;
 }
@@ -711,7 +721,7 @@ async function listBrowserDevices() {
 
 function showBrowserDeviceError(text) {
   const error = element('browser-device-error');
-  error.textContent = text;
+  setMessage(error, text);
   error.hidden = !text;
 }
 
@@ -775,7 +785,7 @@ function installSetup(message) {
 }
 
 function showAddressError(address, text, invalid = false) {
-  address.error.textContent = text;
+  setMessage(address.error, text);
   address.error.hidden = !text;
   if (invalid) {
     address.input.setAttribute('aria-invalid', 'true');
@@ -877,7 +887,7 @@ function control(message) {
       }
       break;
     case 'main-sideband':
-      modeSelect.title = message.text || `MAIN am IC-7610: ${message.mode}`;
+      setMessage(modeSelect, message.text || `MAIN am IC-7610: ${message.mode}`, 'title');
       break;
     case 'rx-filter':
       installFilter(message);
@@ -908,7 +918,7 @@ function control(message) {
       ft.handle(message);
       break;
     case 'main-status':
-      element('main-frequency').title = message.text;
+      setMessage(element('main-frequency'), message.text, 'title');
       break;
     case 'bridge-status':
       if (!lastProblem || message.text !== 'Backend-Verbindung beendet') {
@@ -984,7 +994,7 @@ function connect() {
       try {
         control(JSON.parse(event.data));
       } catch (error) {
-        console.error('Ungültige Backend-Nachricht', error);
+        console.error(translate('Ungültige Backend-Nachricht'), error);
       }
     } else {
       binary(event.data);
@@ -996,7 +1006,7 @@ function connect() {
     }
     bandSelect.disabled = true;
     modeSelect.disabled = true;
-    modeSelect.title = '';
+    setMessage(modeSelect, '', 'title');
     volume.disabled = true;
     activeBand = null;
     setupState = null;
@@ -1152,7 +1162,6 @@ setInterval(() => {
     send({op: 'ptt', action: 'keepalive', id: pttId});
   }
 }, 250);
-allowAudioDevices.textContent = audioDevicePicker ? 'Wiedergabegerät freigeben …' : 'Soundkarten freigeben …';
 allowAudioDevices.addEventListener('click', () => grantBrowserDevices());
 allowMicrophones.addEventListener('click', () => grantBrowserDevices(true));
 browserSpeaker.addEventListener('change', () => selectBrowserSpeaker(browserSpeaker.value));
@@ -1173,7 +1182,33 @@ const openDesktopMenus = !matchMedia('(max-width: 730px)').matches;
 element('receive-menu').open = openDesktopMenus;
 element('filter-menu').open = openDesktopMenus;
 
-renderBrowserDevices();
-renderTx();
+function applyLanguage(next) {
+  setLanguage(next);
+  languageSelect.value = language;
+  txMeterFormat = new Intl.NumberFormat(locale, {minimumFractionDigits: 1, maximumFractionDigits: 1});
+  frequencyFormat = new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 6, maximumFractionDigits: 6, useGrouping: false,
+  });
+  rangeFormat = new Intl.NumberFormat(locale, {maximumFractionDigits: 5, useGrouping: false});
+  allowAudioDevices.textContent = translate(audioDevicePicker ? 'Wiedergabegerät freigeben …' : 'Soundkarten freigeben …');
+  element('zoom-range').textContent = `MAIN ±${rangeFormat.format(halfSpan / 1000)} kHz`;
+  for (const button of filterPresets) button.textContent = `${rangeFormat.format(button.dataset.bandwidth / 1000)} k`;
+  renderBandRange();
+  setMain(mainHz, mainConfirmed);
+  renderFilter();
+  renderTxMeters(txMeterReadings);
+  renderBrowserDevices();
+  renderTx();
+  ft.languageChanged();
+  overview.languageChanged();
+  zoom.languageChanged();
+}
+
+languageSelect.addEventListener('change', () => {
+  applyLanguage(languageSelect.value);
+  preferences.language = language;
+  savePreferences();
+});
+applyLanguage(preferences.language);
 restoreBandThresholds(preferredBand);
 connect();

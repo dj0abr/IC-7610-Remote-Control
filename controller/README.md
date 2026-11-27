@@ -36,7 +36,9 @@ Der IC-7610 hat pro Backend einen Bedienplatz. Das Backend gibt den I/Q-Strom be
 
 ### Bedienung
 
-Die Anzeige zeigt MAIN und SUB oben, die aufklappbaren Einstellungen links und Fullband und Zoom rechts. Auf schmalen Bildschirmen stehen die Einstellungen über den Diagrammen und sind beim Laden eingeklappt. Die WebGUI wählt beim ersten Start 40 m. Ein Link wie `/?band=80m` öffnet direkt das 80-m-Band. Die letzte Bandauswahl bleibt im Browser gespeichert.
+Die Anzeige zeigt MAIN und SUB oben, die aufklappbaren Einstellungen links und Bandübersicht und Zoom rechts. Auf schmalen Bildschirmen stehen die Einstellungen über den Diagrammen und sind beim Laden eingeklappt. Die WebGUI wählt beim ersten Start 40 m. Ein Link wie `/?band=80m` öffnet direkt das 80-m-Band. Die letzte Bandauswahl bleibt im Browser gespeichert.
+
+Unter **Setup → Sprache** lässt sich die Anzeige sofort auf Deutsch oder Englisch umstellen. Der Browser speichert die Auswahl lokal. Funknachrichten und Rufzeichen werden in ihrer ursprünglichen Form angezeigt.
 
 Bei der Bandauswahl stimmt das Backend MAIN direkt per CI-V auf die Bandmitte ab, sofern MAIN am Gerät noch außerhalb des gewählten Bands liegt. Parallel stimmt der Pi SUB auf die I/Q-Mitte des Bands ab. Ein Klick oder Tipp in das Spektrum oder den Wasserfall setzt MAIN auf die Frequenz an der gewählten Position. Das Mausrad verstellt MAIN je Rastschritt um 50 Hz. MAIN-Anzeige und Markierungen folgen sofort der Softwarefrequenz. Ein eigener Thread synchronisiert sie per CI-V mit dem Funkgerät und liest Änderungen am Abstimmknopf zurück.
 

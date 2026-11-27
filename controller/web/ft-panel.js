@@ -1,4 +1,5 @@
 import {countryFlagPosition, dxccForCall} from '/dxcc.js';
+import {language, locale, setMessage, translate} from '/i18n.js';
 import {waterfallColors, minimumLevel} from '/plots.js';
 
 const $ = id => document.getElementById(id);
@@ -11,13 +12,15 @@ const stateLabels = {
   closing: 'QSO abschließen',
   'free-text': 'Freitext senden',
 };
+const regionNames = Object.fromEntries(['de', 'en'].map(lang =>
+  [lang, new Intl.DisplayNames(lang, {type: 'region', fallback: 'none'})]));
 
 export function createFtPanel({send, preferences, savePreferences}) {
   let radio = {connected: false, dial: 0};
   let state = emptyState;
   let active = false;
   let mode = preferences.ftMode === 'FT4' ? 'FT4' : 'FT8';
-  let error = '', outcome = '';
+  let error = '', outcome = null;
   let revision = 0;
   let settingsDirty = false;
   let clock;
@@ -42,17 +45,25 @@ export function createFtPanel({send, preferences, savePreferences}) {
   const arm = $('ft-arm'), auto = $('ft-auto');
   const nextTx = $('ft-next-tx');
   const adifDownload = $('ft-adif-download');
+  const adifPath = adifDownload.getAttribute('href');
   const adifMessage = $('ft-adif-message');
   const adifDownloadError = $('ft-adif-download-error');
+  const qrzStatus = $('ft-qrz-status');
+  const freeText = $('ft8-message');
+  const stationInputs = [callInput, gridInput, offsetInput, levelInput];
+  const requiredInputs = [...stationInputs, freeText];
 
   adifDownload.onclick = async event => {
-    adifDownloadError.textContent = '';
+    setMessage(adifDownloadError, '');
     if (typeof window.showSaveFilePicker !== 'function' || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
     try {
       const destination = await window.showSaveFilePicker({suggestedName: adifDownload.download});
-      const response = await fetch(adifDownload.href);
-      if (!response.ok) throw new Error(await response.text());
+      const response = await fetch(adifPath);
+      if (!response.ok) {
+        setMessage(adifDownloadError, await response.text() || 'ADIF-Download fehlgeschlagen.');
+        return;
+      }
       await response.body.pipeTo(await destination.createWritable());
     } catch (failure) {
       if (failure.name === 'AbortError') return;
@@ -60,13 +71,13 @@ export function createFtPanel({send, preferences, savePreferences}) {
         window.location.assign(adifDownload.href);
         return;
       }
-      adifDownloadError.textContent = failure.message || 'ADIF-Download fehlgeschlagen.';
+      setMessage(adifDownloadError, 'ADIF-Download fehlgeschlagen.');
     }
   };
 
   function request(op, values = {}) {
     error = '';
-    outcome = '';
+    outcome = null;
     const id = ++revision;
     if (send({op, ...values, request_id: id})) {
       const timeout = setTimeout(() => {
@@ -151,7 +162,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
   const cqOnly = $('ft-cq-only');
   function applyCqOnly() {
     ft8Log.output.toggleAttribute('data-cq-only', cqOnly.checked);
-    ft8Log.output.setAttribute('aria-label', cqOnly.checked ? 'FT4/8-CQ-Rufe' : 'Alle FT4/8-Nachrichten');
+    ft8Log.output.setAttribute('aria-label', translate(cqOnly.checked ? 'FT4/8-CQ-Rufe' : 'Alle FT4/8-Nachrichten'));
     scheduleFtLogScroll(ft8Log);
   }
   cqOnly.checked = preferences.ftCqOnly === true;
@@ -188,11 +199,12 @@ export function createFtPanel({send, preferences, savePreferences}) {
     log.output.textContent = '';
     scrollFtLogToEnd(log);
   }
-  const ftRegionNames = new Intl.DisplayNames('de', {type: 'region', fallback: 'none'});
   function updateFtCountry(node) {
     const {region, entity} = node.dataset;
-    const name = region === 'GB' ? 'UK' : (region && ftRegionNames.of(region)) || entity;
-    node.querySelector('.ft-country-name').textContent = name;
+    const name = region && region !== 'ZZ' && regionNames[language].of(region);
+    node.querySelector('.ft-country-name').textContent = region === 'GB' ? 'UK' : name || translate(entity);
+    node.title = name && entity.toLowerCase() === regionNames.en.of(region)?.toLowerCase()
+      ? name : translate(entity);
   }
   function ftDecodeFields(line, metadata, text, fields) {
     if (!fields) {
@@ -218,7 +230,6 @@ export function createFtPanel({send, preferences, savePreferences}) {
     country.className = 'ft-country';
     country.dataset.region = location.code;
     country.dataset.entity = location.entity;
-    country.title = location.entity;
     const position = countryFlagPosition(location.code);
     if (position) {
       const flag = document.createElement('span');
@@ -249,7 +260,9 @@ export function createFtPanel({send, preferences, savePreferences}) {
     progress.value = now % state.slot_ms;
     const seconds = state.armed && !state.sending && Number.isFinite(state.next_tx_ms)
       ? Math.ceil((state.next_tx_ms - now) / 1000) : 0;
-    const countdown = seconds > 0 ? `· TX ${state.next_tx_planned ? '' : 'frühestens '}in ${seconds} s` : '';
+    const countdown = seconds > 0
+      ? `· ${translate(state.next_tx_planned ? 'TX in {seconds} s' : 'TX frühestens in {seconds} s', {seconds})}`
+      : '';
     if (nextTx.textContent !== countdown) nextTx.textContent = countdown;
   }
 
@@ -263,7 +276,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
     $('zoom').hidden = active;
     $('ft-clear').hidden = !active;
     $('ft8-frequency').textContent = radio.dial
-      ? `MAIN ${(radio.dial / 1e6).toLocaleString('de-DE', {minimumFractionDigits:6})} MHz · USB` : 'MAIN';
+      ? `MAIN ${(radio.dial / 1e6).toLocaleString(locale, {minimumFractionDigits:6})} MHz · USB` : 'MAIN';
     modeSelect.value = mode;
     modeSelect.disabled = changingMode || radio.paused || radio.voiceBusy;
     arm.checked = !!state.armed;
@@ -275,7 +288,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
     $('ft8-send').disabled = !readyToStart;
     $('ft8-stop').disabled = !state.busy && state.auto === 'off';
     const canEdit = !state.armed && !state.busy && !requests.size;
-    for (const control of [callInput, gridInput, offsetInput, levelInput, $('ft-save')]) {
+    for (const control of [...stationInputs, $('ft-save')]) {
       control.disabled = !canEdit;
     }
     for (const log of [ft8Log, ftOwnLog]) {
@@ -283,14 +296,15 @@ export function createFtPanel({send, preferences, savePreferences}) {
         if (line.tagName === 'BUTTON') line.disabled = !readyToStart;
       }
     }
-    const qso = [state.peer, stateLabels[state.state],
-      state.retries ? `Wiederholungen ${state.retries}` : ''].filter(Boolean).join(' · ');
+    const qso = [state.peer, translate(stateLabels[state.state]),
+      state.retries ? translate('Wiederholungen {count}', {count: state.retries}) : ''].filter(Boolean).join(' · ');
     $('ft-contact').hidden = !qso;
     $('ft-qso-status').textContent = qso;
     const status = $('ft8-status');
     const needsStation = active && (!state.callsign || !state.locator);
-    status.textContent = error || (needsStation ? 'Rufzeichen und QTH-Locator eingeben und speichern.' :
-      state.sending ? 'Sendet …' : outcome);
+    status.textContent = translate(error || (needsStation ? 'Rufzeichen und QTH-Locator eingeben und speichern.' :
+      state.sending ? 'Sendet …' : '')) ||
+      (outcome ? [outcome.peer, translate(outcome.text)].filter(Boolean).join(' · ') : '');
     status.classList.toggle('error', !!error);
     status.classList.toggle('sending', state.sending && !error);
   }
@@ -301,6 +315,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
     gridInput.value = state.locator || preferences.ftOwnGrid || '';
     offsetInput.value = saved ? state.tx_hz : Math.max(200, Math.min(Number(offsetInput.max), Number(preferences.ftAudioHz) || 1500));
     levelInput.value = saved ? state.tx_level : preferences.ftTxLevel ?? 25;
+    for (const input of stationInputs) input.setCustomValidity('');
   }
 
   function update(next) {
@@ -311,7 +326,8 @@ export function createFtPanel({send, preferences, savePreferences}) {
       active = false;
       clock = null;
       settingsDirty = false;
-      error = outcome = '';
+      error = '';
+      outcome = null;
       clearFt8();
       clearWaterfall();
     }
@@ -349,12 +365,12 @@ export function createFtPanel({send, preferences, savePreferences}) {
         if (lastMode !== message.mode) {
           clearFt8();
           clearWaterfall();
-          adifMessage.textContent = '';
-          adifDownloadError.textContent = '';
-          $('ft-qrz-status').textContent = '';
+          setMessage(adifMessage, '');
+          setMessage(adifDownloadError, '');
+          setMessage(qrzStatus, '');
           offsetInput.max = mode === 'FT4' ? 3930 : 3950;
           const labels = mode === 'FT4' ? [':00 / :15 / :30 / :45', ':07.5 / :22.5 / :37.5 / :52.5'] : [':00 / :30', ':15 / :45'];
-          paritySelect.replaceChildren(new Option('Automatisch', 'auto'), ...labels.map((label, index) => new Option(label, index)));
+          paritySelect.replaceChildren(new Option(translate('Automatisch'), 'auto'), ...labels.map((label, index) => new Option(label, index)));
         }
         if (!settingsDirty) fillSettings();
         renderClock();
@@ -371,14 +387,14 @@ export function createFtPanel({send, preferences, savePreferences}) {
         if (message.kind === 'slot') return;
         if (message.kind === 'adif' || message.kind === 'qrz') {
           const adif = message.kind === 'adif';
-          const log = adif ? adifMessage : $('ft-qrz-status');
-          log.textContent = adif ? message.text.replace(/^ADIF: */, '') : message.text;
+          const log = adif ? adifMessage : qrzStatus;
+          setMessage(log, adif ? message.text.replace(/^ADIF: */, '') : message.text);
           log.classList.toggle('setting-error', message.outcome === 'error');
         } else if (message.kind === 'error') {
           error = message.text;
         } else {
-          outcome = [message.peer, message.outcome === 'completed' && message.kind === 'qso' ? 'QSO abgeschlossen' : message.text]
-            .filter(Boolean).join(' · ');
+          outcome = {peer: message.peer,
+            text: message.outcome === 'completed' && message.kind === 'qso' ? 'QSO abgeschlossen' : message.text};
           if (message.outcome === 'completed') error = '';
         }
         break;
@@ -408,6 +424,15 @@ export function createFtPanel({send, preferences, savePreferences}) {
     context.putImageData(row, 0, 0);
   }
 
+  function languageChanged() {
+    adifDownload.href = language === 'en' ? `${adifPath}?lang=en` : adifPath;
+    paritySelect.options[0].textContent = translate('Automatisch');
+    for (const node of panel.querySelectorAll('.ft-country')) updateFtCountry(node);
+    for (const input of requiredInputs) input.setCustomValidity('');
+    applyCqOnly();
+    renderView();
+    renderClock();
+  }
 
   view.addEventListener('change', ({target}) => {
     if (target.name === 'receiver-view') request('ft_mode', {mode: target.value === 'ft' ? mode : 'off'});
@@ -429,8 +454,29 @@ export function createFtPanel({send, preferences, savePreferences}) {
   $('ft8-stop').onclick = () => request('ft_abort');
   $('ft8-tx-form').onsubmit = event => {
     event.preventDefault();
-    request('ft_free_text', {text: $('ft8-message').value});
+    request('ft_free_text', {text: freeText.value});
   };
+  for (const input of requiredInputs) {
+    input.addEventListener('input', () => input.setCustomValidity(''));
+    input.addEventListener('invalid', () => {
+      input.setCustomValidity('');
+      const validity = input.validity;
+      let text = 'Einen gültigen Wert eingeben.';
+      let values;
+      if (validity.valueMissing) text = 'Dieses Feld ausfüllen.';
+      else if (validity.tooShort) {
+        text = 'Mindestens {min} Zeichen eingeben.';
+        values = {min: input.minLength};
+      } else if (validity.tooLong) {
+        text = 'Höchstens {max} Zeichen eingeben.';
+        values = {max: input.maxLength};
+      } else if (validity.rangeUnderflow || validity.rangeOverflow || validity.stepMismatch) {
+        text = 'Eine ganze Zahl zwischen {min} und {max} eingeben.';
+        values = {min: input.min, max: input.max};
+      } else if (validity.valid) return;
+      input.setCustomValidity(translate(text, values));
+    });
+  }
   $('ft-clear').onclick = clearFt8;
   for (const section of [view, panel]) {
     section.addEventListener('keydown', event => {
@@ -440,7 +486,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
   setInterval(renderClock, 200);
 
   return {
-    update, handle, addFrame, active: () => active, busy: () => !!(state.armed || state.busy),
+    update, handle, addFrame, languageChanged, active: () => active, busy: () => !!(state.armed || state.busy),
     setStyle(lower, upper, color) { palette = waterfallColors(color, lower, upper); }
   };
 }

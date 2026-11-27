@@ -3,6 +3,7 @@
     <file>web/index.html</file>
     <file>web/style.css</file>
     <file>web/app.js</file>
+    <file>web/i18n.js</file>
     <file>web/plots.js</file>
     <file>web/audio.js</file>
     <file>web/tx-audio.js</file>
