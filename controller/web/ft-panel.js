@@ -40,6 +40,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
   const paritySelect = $('ft8-parity');
   const settings = $('ft-settings');
   const arm = $('ft-arm'), auto = $('ft-auto');
+  const nextTx = $('ft-next-tx');
   const adifDownload = $('ft-adif-download');
   const adifMessage = $('ft-adif-message');
   const adifDownloadError = $('ft-adif-download-error');
@@ -239,12 +240,17 @@ export function createFtPanel({send, preferences, savePreferences}) {
     if (!active || !clock || !state.slot_ms) {
       label.textContent = '--:--:-- UTC';
       progress.value = 0;
+      if (nextTx.textContent) nextTx.textContent = '';
       return;
     }
     const now = Math.floor(clock.utc + performance.now() - clock.at);
     label.textContent = `${new Date(now).toISOString().slice(11, 19)} UTC`;
     progress.max = state.slot_ms;
     progress.value = now % state.slot_ms;
+    const seconds = state.armed && !state.sending && Number.isFinite(state.next_tx_ms)
+      ? Math.ceil((state.next_tx_ms - now) / 1000) : 0;
+    const countdown = seconds > 0 ? `· TX ${state.next_tx_planned ? '' : 'frühestens '}in ${seconds} s` : '';
+    if (nextTx.textContent !== countdown) nextTx.textContent = countdown;
   }
 
   function renderView() {

@@ -32,7 +32,7 @@ sudo apt install -y git
 git clone https://github.com/dj0abr/IC-7610-Remote-Control.git "$HOME/kmcontrol"
 ```
 
-Für FT4/FT8 braucht das Backend zusätzlich libft8 ab Version 0.2. Kopiere den libft8-Quellbaum auf den Pi, zum Beispiel nach `~/libft8`. Das Installationsskript baut die Library mit. Für eine bereits installierte ARM64-Version kann alternativ `LIBFT8_ROOT` auf deren Installationspräfix zeigen.
+Für FT4/FT8 braucht das Backend zusätzlich libft8 ab Version 0.2.1. Kopiere den libft8-Quellbaum auf den Pi, zum Beispiel nach `~/libft8`. Das Installationsskript baut die Library mit. Für eine bereits installierte ARM64-Version kann alternativ `LIBFT8_ROOT` auf deren Installationspräfix zeigen.
 
 ```bash
 cd "$HOME/kmcontrol"

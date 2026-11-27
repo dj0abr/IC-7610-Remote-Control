@@ -532,7 +532,9 @@ button.ft-decode-line:disabled { opacity: 1; }
 #ft8-message { width: 100%; }
 .ft-status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; color: var(--muted); }
 .ft-contact { align-items: center; flex: 1 1 auto; }
-#ft-qso-status { font-family: var(--mono); color: var(--accent); overflow-wrap: anywhere; }
+#ft-qso-status, #ft-next-tx { font-family: var(--mono); color: var(--accent); overflow-wrap: anywhere; }
+#ft-next-tx { white-space: nowrap; }
+#ft-next-tx:empty { display: none; }
 #ft8-status, #ft-adif-status, #ft-qrz-status { margin: 0; }
 #ft-adif-download { color: var(--accent); }
 #ft-qrz-status:empty { display: none; }

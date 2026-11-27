@@ -748,6 +748,9 @@ private:
     void sendFtState()
     {
         const auto now = ft8::Time::clock::now();
+        const bool sending = m_ftRadio && m_ftRadio->started;
+        const auto* timing = m_ftTxTiming && m_ftArmed && !sending && (!m_ftRadio || !m_ftRadio->cancelled)
+            ? &*m_ftTxTiming : nullptr;
         m_ftStateSent = std::chrono::steady_clock::now();
         send({{QStringLiteral("type"), QStringLiteral("ft-state")},
               {QStringLiteral("mode"), m_ftMode ? ftModeName(*m_ftMode) : QStringLiteral("off")},
@@ -755,7 +758,7 @@ private:
               {QStringLiteral("ready"), bool(m_ft)},
               {QStringLiteral("tx_ready"), ftCanTransmit()},
               {QStringLiteral("armed"), m_ftArmed},
-              {QStringLiteral("sending"), m_ftRadio && m_ftRadio->started},
+              {QStringLiteral("sending"), sending},
               {QStringLiteral("busy"), m_ftState != ft8::State::Receiving || m_ftRadio.has_value()},
               {QStringLiteral("state"), ftStateName(m_ftState)},
               {QStringLiteral("auto"), ftAutoName(m_ftAuto)},
@@ -766,6 +769,8 @@ private:
               {QStringLiteral("tx_hz"), ftTxOffset()},
               {QStringLiteral("tx_level"), m_ftLevel},
               {QStringLiteral("utc_ms"), utcMilliseconds(now)},
+              {QStringLiteral("next_tx_ms"), timing ? QJsonValue(utcMilliseconds(timing->audio_start)) : QJsonValue()},
+              {QStringLiteral("next_tx_planned"), timing && timing->planned},
               {QStringLiteral("slot_ms"), m_ftMode ? static_cast<int>(ft8::slot_duration(*m_ftMode).count()) : 0}});
     }
 
@@ -1064,6 +1069,7 @@ private:
         m_ftArmed = false;
         m_ftAuto = ft8::AutoMode::Off;
         m_ftState = ft8::State::Receiving;
+        m_ftTxTiming.reset();
         m_ftPeer.clear();
         m_ftRetries = 0;
     }
@@ -1240,9 +1246,14 @@ private:
 
     void pollFt()
     {
+        const auto lastStateSent = m_ftStateSent;
+        bool timingChanged = false;
         if (m_ft)
         {
-            for (const auto& event : m_ft->take_events())
+            auto [events, timing] = m_ft->take_events_with_timing();
+            timingChanged = m_ftTxTiming != timing;
+            m_ftTxTiming = timing;
+            for (const auto& event : events)
             {
                 handleFtEvent(event);
             }
@@ -1251,7 +1262,8 @@ private:
                 handleFtRadio(action);
             }
         }
-        if (std::chrono::steady_clock::now() - m_ftStateSent >= std::chrono::seconds(1))
+        if ((timingChanged && m_ftStateSent == lastStateSent) ||
+            std::chrono::steady_clock::now() - m_ftStateSent >= std::chrono::seconds(1))
         {
             sendFtState();
         }
@@ -1975,6 +1987,7 @@ private:
     std::optional<FtRadio> m_ftRadio;
     QTimer m_ftPoll;
     std::chrono::steady_clock::time_point m_ftStateSent{};
+    std::optional<ft8::TxTiming> m_ftTxTiming;
     std::deque<std::pair<quint64, ft8::Decode>> m_ftDecodes;
     quint64 m_ftNextDecodeId = 0;
     quint64 m_ftNextTxToken = 0;
