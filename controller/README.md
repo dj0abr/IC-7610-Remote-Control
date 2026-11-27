@@ -84,7 +84,7 @@ Aktiviere **FT-TX freigeben**, um ein QSO zu starten, CQ zu rufen oder Freitext 
 
 **Einmal senden** sendet bis zu 13 Zeichen FT-Freitext. Die Slotwahl daneben gilt für einen manuellen CQ-Ruf. **TX-Pegel** regelt die Tonamplitude und **Sendeleistung** die HF-Leistung. Das Backend resampelt das Audio für den 16-kHz-LAN-Kanal. `--ft-ptt-lead-ms` konfiguriert den PTT-Vorlauf. Der Standardwert ist 280 ms.
 
-libft8 schreibt abgeschlossene QSOs in die bisherige Datei `ft4-ft8.adi` im lokalen Datenverzeichnis des Backends. Unter Linux ist das standardmäßig `~/.local/share/kmcontrol/kmcontrol-backend/`. Vorhandene Einträge bleiben erhalten. Neue Einträge verwenden die bestätigte Dial-Frequenz in `FREQ`. Optional lädt libft8 neue Einträge mit `KMCONTROL_QRZ_API_KEY` oder `--qrz-api-key` an QRZ hoch. Das WebGUI zeigt Ergebnis oder Fehler für ADIF und QRZ an.
+libft8 schreibt abgeschlossene QSOs in die bisherige Datei `ft4-ft8.adi` im lokalen Datenverzeichnis des Backends. Unter Linux ist das standardmäßig `~/.local/share/kmcontrol/kmcontrol-backend/`. Vorhandene Einträge bleiben erhalten. Neue Einträge verwenden die bestätigte Dial-Frequenz in `FREQ`. Über **ADIF:** im FT-Fenster lässt sich das gesamte Logbuch herunterladen. Optional lädt libft8 neue Einträge mit `KMCONTROL_QRZ_API_KEY` oder `--qrz-api-key` an QRZ hoch. Das WebGUI zeigt Ergebnis oder Fehler für ADIF und QRZ an.
 
 ### TCP-Schnittstelle der Web-Bridge
 

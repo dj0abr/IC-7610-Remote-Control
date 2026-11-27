@@ -40,6 +40,28 @@ export function createFtPanel({send, preferences, savePreferences}) {
   const paritySelect = $('ft8-parity');
   const settings = $('ft-settings');
   const arm = $('ft-arm'), auto = $('ft-auto');
+  const adifDownload = $('ft-adif-download');
+  const adifMessage = $('ft-adif-message');
+  const adifDownloadError = $('ft-adif-download-error');
+
+  adifDownload.onclick = async event => {
+    adifDownloadError.textContent = '';
+    if (typeof window.showSaveFilePicker !== 'function' || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    try {
+      const destination = await window.showSaveFilePicker({suggestedName: adifDownload.download});
+      const response = await fetch(adifDownload.href);
+      if (!response.ok) throw new Error(await response.text());
+      await response.body.pipeTo(await destination.createWritable());
+    } catch (failure) {
+      if (failure.name === 'AbortError') return;
+      if (failure.name === 'SecurityError') {
+        window.location.assign(adifDownload.href);
+        return;
+      }
+      adifDownloadError.textContent = failure.message || 'ADIF-Download fehlgeschlagen.';
+    }
+  };
 
   function request(op, values = {}) {
     error = '';
@@ -321,7 +343,9 @@ export function createFtPanel({send, preferences, savePreferences}) {
         if (lastMode !== message.mode) {
           clearFt8();
           clearWaterfall();
-          for (const id of ['ft-adif-status', 'ft-qrz-status']) $(id).textContent = '';
+          adifMessage.textContent = '';
+          adifDownloadError.textContent = '';
+          $('ft-qrz-status').textContent = '';
           offsetInput.max = mode === 'FT4' ? 3930 : 3950;
           const labels = mode === 'FT4' ? [':00 / :15 / :30 / :45', ':07.5 / :22.5 / :37.5 / :52.5'] : [':00 / :30', ':15 / :45'];
           paritySelect.replaceChildren(new Option('Automatisch', 'auto'), ...labels.map((label, index) => new Option(label, index)));
@@ -340,8 +364,9 @@ export function createFtPanel({send, preferences, savePreferences}) {
       case 'ft-notice':
         if (message.kind === 'slot') return;
         if (message.kind === 'adif' || message.kind === 'qrz') {
-          const log = $(`ft-${message.kind}-status`);
-          log.textContent = message.text;
+          const adif = message.kind === 'adif';
+          const log = adif ? adifMessage : $('ft-qrz-status');
+          log.textContent = adif ? message.text.replace(/^ADIF: */, '') : message.text;
           log.classList.toggle('setting-error', message.outcome === 'error');
         } else if (message.kind === 'error') {
           error = message.text;

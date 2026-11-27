@@ -1,3 +1,4 @@
+#include "ft-adif-path.hpp"
 #include "spectrum.hpp"
 #include "iq-utc-clock.hpp"
 #include "main-control.hpp"
@@ -9,11 +10,11 @@
 #include <QCommandLineParser>
 #include <QDebug>
 #include <QDir>
+#include <QFileInfo>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSettings>
-#include <QStandardPaths>
 #include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -244,9 +245,9 @@ public:
         connect(&m_pi, &QTcpSocket::errorOccurred, this, &Backend::piError);
         connect(&m_retry, &QTimer::timeout, this, &Backend::connectPi);
         connect(&m_deadline, &QTimer::timeout, this, &Backend::piTimeout);
-        const auto dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-        m_ftConfig.adif_log_path = QDir(dataDir).absoluteFilePath(QStringLiteral("ft4-ft8.adi")).toStdString();
-        if (!QDir().mkpath(dataDir))
+        const QFileInfo logbook(ftAdifPath());
+        m_ftConfig.adif_log_path = logbook.absoluteFilePath().toStdString();
+        if (!QDir().mkpath(logbook.absolutePath()))
         {
             qWarning("FT-Logbuch: Datenverzeichnis konnte nicht angelegt werden.");
         }

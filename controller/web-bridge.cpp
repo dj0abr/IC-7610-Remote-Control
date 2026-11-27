@@ -10,19 +10,24 @@
 #include <QJsonObject>
 #include <QtEndian>
 
+#include "ft-adif-path.hpp"
 #include "icom-lan.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <deque>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/file.h>
+#include <sys/stat.h>
 
 namespace
 {
@@ -488,6 +493,11 @@ private:
             respond(http::status::ok, "application/json", "{\"service\":\"kmcontrol-web\"}");
             return;
         }
+        if (path == "/ft4-ft8.adi")
+        {
+            downloadAdif();
+            return;
+        }
         for (const auto& asset : assets)
         {
             if (asset.path == path)
@@ -504,20 +514,79 @@ private:
         respond(http::status::not_found, "text/plain; charset=utf-8", "Datei nicht gefunden.");
     }
 
-    void respond(http::status status, const char* mime, std::string body)
+    void downloadAdif()
     {
-        m_response.emplace(status, m_version);
-        m_response->set(http::field::server, "kmcontrol-web");
-        m_response->set(http::field::content_type, mime);
-        m_response->set(http::field::cache_control, "no-store");
-        m_response->set("X-Content-Type-Options", "nosniff");
+        constexpr auto text = "text/plain; charset=utf-8";
+        constexpr auto readError = "ADIF-Logbuch kann nicht gelesen werden.";
+        const auto path = QFile::encodeName(ftAdifPath());
+        const int fd = ::open(path.constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0)
+        {
+            const bool missing = errno == ENOENT;
+            respond(missing ? http::status::not_found : http::status::internal_server_error, text,
+                    missing ? "ADIF-Logbuch ist noch nicht vorhanden." : readError);
+            return;
+        }
+        beast::file_posix file;
+        file.native_handle(fd);
+        struct stat info{};
+        if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode))
+        {
+            respond(http::status::internal_server_error, text, readError);
+            return;
+        }
+
+        auto response = std::make_unique<http::response<http::file_body>>(http::status::ok, m_version);
+        if (::flock(fd, LOCK_SH | LOCK_NB) != 0)
+        {
+            const bool busy = errno == EWOULDBLOCK;
+            respond(busy ? http::status::service_unavailable : http::status::internal_server_error, text,
+                    busy ? "ADIF-Logbuch wird gerade geschrieben. Bitte erneut versuchen." : readError);
+            return;
+        }
+        // Capture the committed length, then let the logbook append while we send that snapshot.
+        ErrorCode error;
+        response->body().reset(std::move(file), error);
+        if (::flock(fd, LOCK_UN) != 0 || error)
+        {
+            respond(http::status::internal_server_error, text, readError);
+            return;
+        }
+        setResponseHeaders(response->base(), "application/octet-stream");
+        response->set(http::field::content_disposition, "attachment; filename=\"ft4-ft8.adi\"");
+        response->keep_alive(false);
+        response->content_length(response->body().size());
+        m_fileResponse = std::move(response);
+        if (m_head)
+        {
+            m_fileSerializer = std::make_unique<http::response_serializer<http::file_body>>(*m_fileResponse);
+            http::async_write_header(m_stream, *m_fileSerializer,
+                beast::bind_front_handler(&HttpSession::written, shared_from_this()));
+            return;
+        }
+        http::async_write(m_stream, *m_fileResponse,
+            beast::bind_front_handler(&HttpSession::written, shared_from_this()));
+    }
+
+    void setResponseHeaders(http::response_header<>& response, const char* mime)
+    {
+        response.set(http::field::server, "kmcontrol-web");
+        response.set(http::field::content_type, mime);
+        response.set(http::field::cache_control, "no-store");
+        response.set("X-Content-Type-Options", "nosniff");
         auto policy = "default-src 'self'; connect-src 'self' ws://" + m_bindHost;
         if (m_allowLocalhost)
         {
             policy += " ws://localhost" + m_portSuffix;
         }
         policy += "; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
-        m_response->set("Content-Security-Policy", policy);
+        response.set("Content-Security-Policy", policy);
+    }
+
+    void respond(http::status status, const char* mime, std::string body)
+    {
+        m_response.emplace(status, m_version);
+        setResponseHeaders(m_response->base(), mime);
         m_response->keep_alive(false);
         m_response->content_length(body.size());
         if (m_head)
@@ -543,6 +612,8 @@ private:
     http::request_parser<http::empty_body> m_parser;
     std::optional<http::response<http::string_body>> m_response;
     std::optional<http::response_serializer<http::string_body>> m_serializer;
+    std::unique_ptr<http::response<http::file_body>> m_fileResponse;
+    std::unique_ptr<http::response_serializer<http::file_body>> m_fileSerializer;
     const std::string m_portSuffix;
     const std::string m_bindHost;
     const bool m_allowLocalhost;

@@ -531,11 +531,11 @@ button.ft-decode-line:disabled { opacity: 1; }
 .ft8-message { flex: 1 1 160px; min-width: 0; }
 #ft8-message { width: 100%; }
 .ft-status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; color: var(--muted); }
-.ft-status-bar:has(#ft-contact[hidden]):has(#ft8-status:empty):has(#ft-adif-status:empty):has(#ft-qrz-status:empty) { display: none; }
 .ft-contact { align-items: center; flex: 1 1 auto; }
 #ft-qso-status { font-family: var(--mono); color: var(--accent); overflow-wrap: anywhere; }
 #ft8-status, #ft-adif-status, #ft-qrz-status { margin: 0; }
-#ft-adif-status:empty, #ft-qrz-status:empty { display: none; }
+#ft-adif-download { color: var(--accent); }
+#ft-qrz-status:empty { display: none; }
 #ft8-status.sending { color: #ff9ca5; font-weight: 700; }
 
 @media (max-width: 700px) {
