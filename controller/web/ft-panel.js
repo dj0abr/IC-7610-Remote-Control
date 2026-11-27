@@ -338,11 +338,12 @@ export function createFtPanel({send, preferences, savePreferences}) {
         }
         break;
       case 'ft-notice':
+        if (message.kind === 'slot') return;
         if (message.kind === 'adif' || message.kind === 'qrz') {
           const log = $(`ft-${message.kind}-status`);
           log.textContent = message.text;
           log.classList.toggle('setting-error', message.outcome === 'error');
-        } else if (message.kind === 'error' || message.kind === 'slot') {
+        } else if (message.kind === 'error') {
           error = message.text;
         } else {
           outcome = [message.peer, message.outcome === 'completed' && message.kind === 'qso' ? 'QSO abgeschlossen' : message.text]
