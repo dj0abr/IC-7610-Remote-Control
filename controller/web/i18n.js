@@ -55,6 +55,7 @@ const english = {
   'Alle FT4/8-Nachrichten': 'All FT4/8 messages',
   'FT4/8-CQ-Rufe': 'FT4/8 CQ calls',
   'Zum Ende der oberen Nachrichtenliste': 'Go to the end of the upper message list',
+  'Höhe der oberen Nachrichtenliste': 'Height of the upper message list',
   'Nachrichten mit eigenem Rufzeichen': 'Messages with your callsign',
   'Zum Ende der Nachrichten mit eigenem Rufzeichen': 'Go to the end of messages with your callsign',
   'Warte auf den nächsten vollständigen UTC-Slot …': 'Waiting for the next complete UTC slot …',

@@ -412,7 +412,28 @@ button:not(:disabled):hover { border-color: var(--accent); }
   min-height: 0;
   gap: 8px;
 }
-.ft-logs { display: grid; grid-template-rows: minmax(0, 2fr) minmax(0, 1fr); gap: 6px; min-width: 0; min-height: 0; }
+.ft-logs {
+  --ft-log-divider-height: 6px;
+  display: grid;
+  grid-template-rows:
+    calc((100% - var(--ft-log-divider-height)) * var(--ft-log-split, 2 / 3))
+    var(--ft-log-divider-height) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+.ft-log-divider {
+  position: relative;
+  z-index: 1;
+  cursor: row-resize;
+  touch-action: none;
+}
+.ft-log-divider::before, .ft-log-divider::after {
+  position: absolute;
+  content: "";
+}
+.ft-log-divider::before { inset: 2px 0; border-radius: 1px; background: #60798c; }
+.ft-log-divider::after { inset: -3px 0; }
+.ft-log-divider:is(:hover, :focus-visible, :active)::before { background: var(--accent); }
 .ft8-panel .decoder-text { padding: 5px 6px; }
 .ft-log-pane, .ft-waterfall {
   min-width: 0;

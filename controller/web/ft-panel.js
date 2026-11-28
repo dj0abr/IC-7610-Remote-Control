@@ -195,6 +195,41 @@ export function createFtPanel({send, preferences, savePreferences}) {
     line.textContent = `${utcLabel(message.slot_utc_ms)} TX  ${String(message.audio_hz).padStart(4)} Hz  ${message.text}`;
     appendFtLine(ftOwnLog, line);
   }
+  const logDivider = $('ft-log-divider');
+  const logs = logDivider.parentElement;
+  const minLogSplit = Number(logDivider.getAttribute('aria-valuemin'));
+  const maxLogSplit = Number(logDivider.getAttribute('aria-valuemax'));
+  let logDrag;
+  function setLogSplit(percentage) {
+    const split = Math.min(maxLogSplit, Math.max(minLogSplit, percentage));
+    logs.style.setProperty('--ft-log-split', split / 100);
+    logDivider.setAttribute('aria-valuenow', Math.round(split));
+  }
+  logDivider.addEventListener('pointerdown', event => {
+    if (logDrag || !event.isPrimary || event.button !== 0) return;
+    event.preventDefault();
+    logDivider.focus({preventScroll: true});
+    logDrag = {pointerId: event.pointerId, offset: event.clientY - logDivider.getBoundingClientRect().top};
+    logDivider.setPointerCapture(event.pointerId);
+  });
+  logDivider.addEventListener('pointermove', event => {
+    if (event.pointerId !== logDrag?.pointerId) return;
+    const bounds = logs.getBoundingClientRect();
+    const availableHeight = bounds.height - logDivider.offsetHeight;
+    if (availableHeight > 0) setLogSplit((event.clientY - bounds.top - logDrag.offset) / availableHeight * 100);
+  });
+  logDivider.addEventListener('lostpointercapture', () => { logDrag = undefined; });
+  logDivider.addEventListener('keydown', event => {
+    const current = Number(logDivider.getAttribute('aria-valuenow'));
+    switch (event.key) {
+      case 'ArrowUp': setLogSplit(current - 5); break;
+      case 'ArrowDown': setLogSplit(current + 5); break;
+      case 'Home': setLogSplit(minLogSplit); break;
+      case 'End': setLogSplit(maxLogSplit); break;
+      default: return;
+    }
+    event.preventDefault();
+  });
   for (const log of [ft8Log, ftOwnLog]) {
     const {output} = log;
     const resize = new ResizeObserver(() => scheduleFtLogScroll(log));
