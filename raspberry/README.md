@@ -1,6 +1,6 @@
 # IC-7610 I/Q-Empfangstest auf dem Raspberry Pi 4
 
-Nach der [Treiberinstallation](#ftdi-treiber-für-arm64) auf dem ARM64-Pi aus diesem Verzeichnis einmal `make` und danach `./iq-test` ausführen. Die USB-Gerätenummer `0c26:0029` muss mit `5000M` verbunden und für den ausführenden Benutzer les- und schreibbar sein. Der Test ist für den Empfangsbetrieb vorgesehen.
+Die [automatische Bridge-Installation](../README.md#installation) erfolgt im Hauptverzeichnis mit `./install_bridge.sh`. Für einen manuellen Test nach der [Treiberinstallation](#ftdi-treiber-für-arm64) auf dem ARM64-Pi aus diesem Verzeichnis einmal `make` und danach `./iq-test` ausführen. Die USB-Gerätenummer `0c26:0029` muss mit `5000M` verbunden und für den ausführenden Benutzer les- und schreibbar sein. Der Test ist für den Empfangsbetrieb vorgesehen.
 
 Das Programm prüft den I/Q-Strom auf SUB bei 18,118 MHz für zehn Sekunden. Es misst Byte- und Samplerate und zählt komplexe Samples, bei denen mindestens eine Komponente von null abweicht. Es fragt die ursprüngliche SUB-Frequenz, Dualwatch und I/Q-Quellenauswahl ab, stellt sie nach dem Test wieder her und kontrolliert die Werte. MAIN wird vor und nach der Messung gelesen. Die Samples werden im Speicher ausgewertet. `--probe` liest nur die aktive I/Q-Quelle. Mit `--sub-hz` lässt sich die Testfrequenz in Hz vorgeben.
 

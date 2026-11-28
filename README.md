@@ -22,24 +22,30 @@
 
 ## Installation
 
-Die Installation läuft auf einem Raspberry Pi 4 mit [Raspberry Pi OS Lite (64 Bit)](https://www.raspberrypi.com/software/operating-systems/). Richte zuvor die [Anschlüsse](#anschlüsse) ein.
+Die USB/IQ-Bridge benötigt einen Raspberry Pi mit USB 3.0 und [Raspberry Pi OS (64 Bit)](https://www.raspberrypi.com/software/operating-systems/). Der Controller kann auf demselben Pi oder auf einem separaten Linux-Rechner laufen. Richte zuerst die [Anschlüsse](#anschlüsse) ein.
 
-Als Erstes laden wir die Software von GitHub.
+Auf Raspberry Pi OS, Debian und Ubuntu holst du das Repository so.
 
 ```bash
 sudo apt update
-sudo apt install -y git
+sudo apt install -y git ca-certificates
 git clone https://github.com/dj0abr/IC-7610-Remote-Control.git "$HOME/kmcontrol"
-```
-
-Für FT4/FT8 braucht das Backend zusätzlich libft8 ab Version 0.3.1. Kopiere den libft8-Quellbaum auf den Pi, zum Beispiel nach `~/libft8`. Das Installationsskript baut die Library mit. Für eine bereits installierte ARM64-Version kann alternativ `LIBFT8_ROOT` auf deren Installationspräfix zeigen.
-
-```bash
 cd "$HOME/kmcontrol"
-LIBFT8_SOURCE_DIR="$HOME/libft8" ./build.sh
 ```
 
-Fehlen die Netzwerk-Anmeldedaten des IC-7610, fragt das Skript danach. Die IP des Pi erkennt es selbst. Am Ende zeigt es die Webadresse an.
+| Skript | Zielsystem | Installiert |
+| --- | --- | --- |
+| `./install_all.sh` | Raspberry Pi | USB/IQ-Bridge, Backend und WebGUI auf demselben Gerät |
+| `./install_bridge.sh` | Raspberry Pi | USB/IQ-Bridge mit TCP-Port `50010` |
+| `./install_controller.sh` | Linux-Rechner | Backend und WebGUI für eine separat laufende Bridge |
+
+Die Skripte installieren ihre Abhängigkeiten per `apt`. Der Controller unterstützt außerdem `dnf`, `pacman` und `zypper` auf Distributionen, deren Paketquellen die benötigten [Build-Abhängigkeiten](controller/README.md#backend-und-webgui) führen. Auf anderen Linux-Systemen verwendet der Installer die vorhandene Toolchain und Bibliotheken. Für die Systeminstallation verwendet er bei Bedarf `sudo`.
+
+Die Controller-Installer laden standardmäßig den festgelegten Stand von [libft8 0.3.1](https://github.com/dj0abr/libft8/tree/e281d1a411f0980a914c9e0b9fd097f4c0d17500) von GitHub und bauen ihn mit. `LIBFT8_SOURCE_DIR` wählt einen eigenen Quellbaum. `LIBFT8_ROOT` wählt eine vorhandene libft8-Installation ab Version 0.3.1. Die Bridge-Installer beziehen den FTDI-Treiber bei Bedarf direkt von FTDI. Optional zeigt `KMCONTROL_FTDI_ARCHIVE` auf ein vorhandenes ARMv8-Treiberarchiv.
+
+Mit systemd richten die Installer die jeweiligen Dienste samt Autostart ein. Bei einer Controller-Installation fragen sie bei Bedarf nach den Netzwerk-Anmeldedaten des IC-7610. Alternativ kannst du `KMCONTROL_ICOM_USER` und `KMCONTROL_ICOM_PASSWORD` vorher setzen. Auf Linux ohne laufendes systemd installiert `install_controller.sh` die Programme für den manuellen Start und zeigt die Startbefehle an.
+
+Bei einer Gesamtinstallation verbindet sich das Backend automatisch mit der lokalen Bridge. Bei getrennter Installation kannst du beispielsweise `KMCONTROL_PI_HOST=192.168.10.140 ./install_controller.sh` verwenden oder die Pi-Adresse später im **Setup** der WebGUI eintragen. `KMCONTROL_LISTEN_IP` überschreibt bei Bedarf die automatisch gewählte lokale IPv4-Adresse. Am Ende melden die Installer die Adresse der Bridge beziehungsweise die Webadresse mit Port `8086`.
 
 ## Lokaler Zugriff zuhause
 

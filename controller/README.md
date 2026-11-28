@@ -17,6 +17,8 @@ Der [Quellenindex](../doc/Quellen.md) verlinkt die CI-V-Referenz von Icom, die w
 
 ## Backend und WebGUI
 
+Für die [automatische Installation](../README.md#installation) auf einem Linux-Rechner steht im Hauptverzeichnis `./install_controller.sh` bereit. Das Skript baut bei Bedarf libft8 von GitHub und installiert Backend und WebGUI. Auf einem System mit systemd richtet es den Autostart ein.
+
 Das Backend und die HTTP-/WebSocket-Bridge sind C++20-Programme. Der Build verwendet CMake ab 3.20, libft8 ab Version 0.3.1, Boost, Qt 5.15, FFTW für einfache Genauigkeit (fftw3f), LiquidDSP und SpeexDSP. GNU Fortran wird beim separaten Bau von libft8 benötigt. CMake verwendet standardmäßig die vorhandene LiquidDSP-Installation des QO100-Transceivers und das SpeexDSP-Bundle aus QO100_TRX2. Andere Pfade lassen sich mit `-DLIQUID_ROOT=/pfad/zu/libs` und `-DSPEEXDSP_ROOT=/pfad/zum/bundle` setzen. Ohne passendes SpeexDSP-Bundle verwendet der Build das per pkg-config installierte SpeexDSP-Entwicklungspaket.
 
 ```sh
