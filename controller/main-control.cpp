@@ -17,7 +17,7 @@ namespace
 constexpr auto latchTimeout = 5min;
 using RadioStatus = ft8::RadioReport::Status;
 
-QByteArray digitalTxPcm(std::span<const ft8::Sample> wave, int level)
+std::vector<float> resampleFtAudio(std::span<const ft8::Sample> wave)
 {
     constexpr int inputCount = 3;
     constexpr int outputCount = 4;
@@ -31,11 +31,10 @@ QByteArray digitalTxPcm(std::span<const ft8::Sample> wave, int level)
     }
     rresamp_rrrf_set_scale(resampler.get(), 1.0f);
     const auto groups = (wave.size() + inputCount - 1) / inputCount;
-    QByteArray pcm(static_cast<int>(groups * outputCount * sizeof(qint16)), Qt::Uninitialized);
+    std::vector<float> pcm(groups * outputCount);
     std::array<float, inputCount> input{};
     std::array<float, outputCount> output{};
-    const float gain = level / 100.0f;
-    int position = 0;
+    auto position = pcm.begin();
     for (std::size_t i = 0; i < wave.size(); i += inputCount)
     {
         for (std::size_t j = 0; j < input.size(); ++j)
@@ -43,12 +42,7 @@ QByteArray digitalTxPcm(std::span<const ft8::Sample> wave, int level)
             input[j] = i + j < wave.size() ? wave[i + j] : 0;
         }
         rresamp_rrrf_execute(resampler.get(), input.data(), output.data());
-        for (const auto sample : output)
-        {
-            const auto value = static_cast<qint16>(std::clamp(std::lround(sample * gain), -32768L, 32767L));
-            qToLittleEndian(value, pcm.data() + position);
-            position += sizeof(value);
-        }
+        position = std::copy(output.begin(), output.end(), position);
     }
     return pcm;
 }
@@ -288,7 +282,7 @@ void MainControl::updateTxMeters(Clock::time_point now, std::chrono::millisecond
 }
 
 void MainControl::scheduleDigitalTx(quint64 session, quint64 token, qint64 dialHz,
-                                    ft8::Playback playback, int level)
+                                    ft8::Playback playback)
 {
     if (session != m_session || !m_timer->isActive() || m_digitalTx || m_ownedTx || !m_radio ||
         !playback.frame || playback.frame->samples.empty() || m_cancelDigitalId.load() == token)
@@ -298,7 +292,7 @@ void MainControl::scheduleDigitalTx(quint64 session, quint64 token, qint64 dialH
     }
     try
     {
-        auto pcm = digitalTxPcm(playback.frame->samples, level);
+        auto pcm = resampleFtAudio(playback.frame->samples);
         const auto utc = ft8::Time::clock::now();
         const auto steady = Clock::now();
         const auto packetAt = steady + (playback.audio_start - utc) - icom::txAudioBuffer;
@@ -431,8 +425,7 @@ bool MainControl::processDigitalTx(Clock::time_point now, bool settingWritePendi
                 finishDigitalTx(RadioStatus::Failed, "FT-Audio konnte nicht rechtzeitig beginnen.");
                 return true;
             }
-            const auto lanSamples = (*prefix * icom::txAudioRate + ft8::sample_rate - 1) / ft8::sample_rate;
-            job.position = static_cast<int>(lanSamples * sizeof(qint16));
+            job.position = (*prefix * icom::txAudioRate + ft8::sample_rate - 1) / ft8::sample_rate;
             m_nextAudio = now;
         }
         else if (now - m_nextAudio > 75ms)
@@ -446,9 +439,15 @@ bool MainControl::processDigitalTx(Clock::time_point now, bool settingWritePendi
             return true;
         }
 
-        const auto count = std::min(icom::txAudioBytes, job.pcm.size() - job.position);
+        const auto count = std::min(icom::txAudioBytes / sizeof(qint16), job.pcm.size() - job.position);
         std::array<char, icom::txAudioBytes> packet{};
-        std::copy_n(job.pcm.constData() + job.position, count, packet.begin());
+        const float gain = m_ftTxLevel.load() / 100.0f;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto sample = std::lround(job.pcm[job.position + i] * gain);
+            const auto value = static_cast<qint16>(std::clamp(sample, -32768L, 32767L));
+            qToLittleEndian(value, packet.data() + i * sizeof(value));
+        }
         m_radio->sendTxAudio(packet);
         job.position += count;
         m_nextAudio += 20ms;

@@ -30,6 +30,10 @@ const languageSelect = element('language');
 const addresses = ['radio-ip', 'pi-ip'].map(id => ({
   key: id.replace('-', '_'), input: element(id), error: element(`${id}-error`), pending: null,
 }));
+const qrzKey = {
+  form: element('qrz-key-form'), input: element('qrz-api-key'), status: element('qrz-key-status'),
+  save: element('qrz-key-save'), remove: element('qrz-key-remove'), message: element('qrz-key-message'), pending: null,
+};
 const status = element('status');
 const audioButton = element('audio-toggle');
 const audioError = element('audio-error');
@@ -771,6 +775,7 @@ async function grantBrowserDevices(inputOnly = false) {
 function installSetup(message) {
   const first = !setupState;
   setupState = message;
+  updateQrzStatus();
   if (!first) {
     return;
   }
@@ -782,6 +787,53 @@ function installSetup(message) {
   setVolume(message.volume);
   volume.disabled = false;
   renderTx();
+}
+
+function renderQrzControls() {
+  const configured = setupState?.qrz_configured;
+  qrzKey.input.disabled = typeof configured !== 'boolean' || !!qrzKey.pending;
+  qrzKey.save.disabled = qrzKey.input.disabled || !qrzKey.input.value.trim();
+  qrzKey.remove.disabled = qrzKey.input.disabled || !configured;
+}
+
+function updateQrzStatus() {
+  const configured = setupState?.qrz_configured;
+  const text = typeof configured !== 'boolean' ? 'QRZ-Logbuch nicht verfügbar.' :
+    configured ? 'Schlüssel hinterlegt.' : 'Kein Schlüssel hinterlegt.';
+  setMessage(qrzKey.status, text);
+  renderQrzControls();
+}
+
+function showQrzMessage(text, error = false) {
+  setMessage(qrzKey.message, text);
+  qrzKey.message.hidden = !text;
+  qrzKey.message.classList.toggle('setting-error', error);
+}
+
+function finishQrzRequest(message) {
+  const {removing, timeout} = qrzKey.pending;
+  clearTimeout(timeout);
+  qrzKey.pending = null;
+  if (message.ok) {
+    qrzKey.input.value = '';
+    showQrzMessage(removing ? 'Schlüssel entfernt.' : 'Schlüssel gespeichert.');
+  } else {
+    showQrzMessage(message.text || 'QRZ-Logbuchschlüssel konnte nicht gespeichert werden.', true);
+  }
+  renderQrzControls();
+}
+
+function saveQrzKey(key) {
+  if (qrzKey.input.disabled) return;
+  const id = ++nextSetupId;
+  if (!send({op: 'ft_qrz_key', key, request_id: id})) {
+    showQrzMessage('Backend nicht verbunden.', true);
+    return;
+  }
+  const timeout = setTimeout(() => finishQrzRequest({ok: false, text: 'Keine Antwort vom Backend.'}), 6000);
+  qrzKey.pending = {id, removing: !key, timeout};
+  showQrzMessage('');
+  renderQrzControls();
 }
 
 function showAddressError(address, text, invalid = false) {
@@ -822,6 +874,10 @@ function commitAddress(address) {
 }
 
 function setupResult(message) {
+  if (qrzKey.pending && qrzKey.pending.id === message.request_id) {
+    finishQrzRequest(message);
+    return;
+  }
   const address = addresses.find(field => field.pending && field.pending.id === message.request_id);
   if (!address) {
     return;
@@ -1010,6 +1066,11 @@ function connect() {
     volume.disabled = true;
     activeBand = null;
     setupState = null;
+    clearTimeout(qrzKey.pending?.timeout);
+    qrzKey.pending = null;
+    qrzKey.input.value = '';
+    showQrzMessage('');
+    updateQrzStatus();
     updateTx({phase: 'offline', ready: false});
     clearTimeout(filterTimer);
     rxFilter = null;
@@ -1135,7 +1196,7 @@ window.addEventListener('keydown', event => {
   const target = event.target;
   if (!key || (key === 'Enter' && target !== pttButton) || pttButton.disabled ||
       event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey ||
-      target.isContentEditable || target.closest?.('input, textarea, select, summary') ||
+      target.isContentEditable || target.closest?.('input, textarea, select, summary, #qrz-key-form button') ||
       (!pttId && target.closest?.('.filter-presets button'))) {
     return;
   }
@@ -1168,6 +1229,23 @@ browserSpeaker.addEventListener('change', () => selectBrowserSpeaker(browserSpea
 browserMicrophone.addEventListener('change', selectMicrophone);
 mediaDevices?.addEventListener('devicechange', refreshBrowserDevices);
 setup.addEventListener('toggle', refreshBrowserDevices);
+setup.addEventListener('toggle', () => {
+  if (!setup.open) {
+    qrzKey.input.value = '';
+    renderQrzControls();
+  }
+});
+qrzKey.input.addEventListener('input', () => {
+  showQrzMessage('');
+  renderQrzControls();
+});
+qrzKey.form.addEventListener('submit', event => {
+  event.preventDefault();
+  const key = qrzKey.input.value.trim();
+  if (key) saveQrzKey(key);
+});
+qrzKey.remove.addEventListener('click', () => saveQrzKey(''));
+updateQrzStatus();
 for (const address of addresses) {
   address.input.addEventListener('input', () => showAddressError(address, ''));
   address.input.addEventListener('change', () => commitAddress(address));

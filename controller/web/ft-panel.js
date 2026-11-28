@@ -22,7 +22,8 @@ export function createFtPanel({send, preferences, savePreferences}) {
   let mode = preferences.ftMode === 'FT4' ? 'FT4' : 'FT8';
   let error = '', outcome = null;
   let revision = 0;
-  let settingsDirty = false;
+  let settingsDirty = false, settingsSubmitted = false;
+  let settingsRevision = 0, settingsTimer = null;
   let clock;
   const requests = new Map();
   const ft8Log = {output:$('ft8-log'), lines:[], follow:true};
@@ -42,7 +43,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
   const offsetInput = $('ft8-audio-hz'), levelInput = $('ft8-level');
   const paritySelect = $('ft8-parity');
   const settings = $('ft-settings');
-  const arm = $('ft-arm'), auto = $('ft-auto');
+  const auto = $('ft-auto');
   const nextTx = $('ft-next-tx');
   const adifDownload = $('ft-adif-download');
   const adifPath = adifDownload.getAttribute('href');
@@ -75,17 +76,14 @@ export function createFtPanel({send, preferences, savePreferences}) {
     }
   };
 
-  function request(op, values = {}) {
+  function request(op, values = {}, draft) {
+    if (pending(op)) return;
     error = '';
     outcome = null;
     const id = ++revision;
     if (send({op, ...values, request_id: id})) {
-      const timeout = setTimeout(() => {
-        requests.delete(id);
-        error = 'Keine Antwort vom Backend.';
-        renderView();
-      }, 6000);
-      requests.set(id, {op, timeout});
+      const timeout = setTimeout(() => finishRequest(id, false, 'Keine Antwort vom Backend.'), 6000);
+      requests.set(id, {op, timeout, values, draft});
     } else {
       error = 'Backend nicht verbunden.';
     }
@@ -93,6 +91,62 @@ export function createFtPanel({send, preferences, savePreferences}) {
   }
   function pending(op) {
     return Array.from(requests.values()).some(request => request.op === op);
+  }
+  function finishRequest(id, ok, text) {
+    const entry = requests.get(id);
+    if (!entry) return;
+    clearTimeout(entry.timeout);
+    requests.delete(id);
+    if (entry.op === 'ft_config') {
+      if (ok) {
+        const {callsign, locator, tx_hz, tx_level} = entry.values;
+        Object.assign(preferences, {ftOwnCall: callsign, ftOwnGrid: locator, ftAudioHz: tx_hz, ftTxLevel: tx_level});
+        savePreferences();
+      }
+      if (entry.draft === settingsRevision) {
+        if (ok) {
+          settingsDirty = false;
+          fillSettings();
+        } else {
+          error = text || 'FT-Befehl fehlgeschlagen.';
+        }
+      } else if (settingsTimer === null) {
+        saveSettings();
+      }
+    } else if (!ok) {
+      error = text || 'FT-Befehl fehlgeschlagen.';
+    }
+    renderView();
+  }
+  function canUseControls() {
+    return active && radio.connected && state.available;
+  }
+  function requestTransmission(op, values) {
+    if (!canUseControls() || !state.configured || settingsDirty || pending('ft_mode')) {
+      renderView();
+      return;
+    }
+    request(op, values);
+  }
+  function saveSettings() {
+    if (!settingsDirty || !radio.connected || !state.available || pending('ft_config')) return;
+    for (const input of stationInputs) input.setCustomValidity('');
+    const callsign = callInput.value.trim().toUpperCase();
+    const locator = gridInput.value.trim().toUpperCase();
+    if (!settings.checkValidity() || !callsign || !locator) {
+      error = 'Bitte gültige FT-Einstellungen eingeben.';
+      renderView();
+      return;
+    }
+    settingsSubmitted = true;
+    request('ft_config', {callsign, locator, tx_hz: offsetInput.valueAsNumber, tx_level: levelInput.valueAsNumber},
+      settingsRevision);
+  }
+  function restoreBrowserSettings() {
+    if (!canUseControls() || state.configured !== false || settingsDirty || settingsSubmitted ||
+        !callInput.value.trim() || !gridInput.value.trim() || !settings.checkValidity()) return;
+    settingsDirty = true;
+    saveSettings();
   }
   function clearFt8() {
     clearFtLog(ft8Log);
@@ -107,9 +161,6 @@ export function createFtPanel({send, preferences, savePreferences}) {
   function utcLabel(ms) {
     const time = new Date(ms);
     return time.toISOString().slice(11, 19) + (ms % 1000 ? '.5' : '');
-  }
-  function canStart() {
-    return active && state.armed && state.tx_ready && !state.busy && !requests.size;
   }
   function appendDecode(message) {
     const {source, destination, value, text, slot_utc_ms: slot, snr_db, dt_s, audio_hz: hz} = message;
@@ -128,10 +179,8 @@ export function createFtPanel({send, preferences, savePreferences}) {
     ftDecodeFields(line, metadata, text, fields);
     if (clickable) {
       line.type = 'button';
-      line.disabled = !canStart();
-      line.onclick = () => {
-        if (canStart()) request('ft_start_qso', {peer: source, decode_id: message.decode_id});
-      };
+      line.disabled = !canUseControls() || pending('ft_start_qso');
+      line.onclick = () => requestTransmission('ft_start_qso', {peer: source, decode_id: message.decode_id});
     }
     appendFtLine(ft8Log, line);
     if (own && (source === own || destination === own)) {
@@ -268,6 +317,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
 
   function renderView() {
     const changingMode = pending('ft_mode');
+    const control = canUseControls();
     zoomChoice.checked = !active;
     ftChoice.checked = active;
     ftChoice.disabled = !state.available || !radio.connected || changingMode || (!active && (radio.paused || radio.voiceBusy));
@@ -278,39 +328,37 @@ export function createFtPanel({send, preferences, savePreferences}) {
     $('ft8-frequency').textContent = radio.dial
       ? `MAIN ${(radio.dial / 1e6).toLocaleString(locale, {minimumFractionDigits:6})} MHz · USB` : 'MAIN';
     modeSelect.value = mode;
-    modeSelect.disabled = changingMode || radio.paused || radio.voiceBusy;
-    arm.checked = !!state.armed;
-    arm.disabled = requests.size > 0 || (!state.armed && (!state.tx_ready || settingsDirty));
+    modeSelect.disabled = !control || changingMode || radio.paused || radio.voiceBusy;
     auto.value = state.auto;
-    auto.disabled = !state.armed || requests.size > 0;
-    const readyToStart = canStart();
-    $('ft-cq').disabled = !readyToStart;
-    $('ft8-send').disabled = !readyToStart;
-    $('ft8-stop').disabled = !state.busy && state.auto === 'off';
-    const canEdit = !state.armed && !state.busy && !requests.size;
-    for (const control of [...stationInputs, $('ft-save')]) {
-      control.disabled = !canEdit;
+    auto.disabled = !control || pending('ft_auto');
+    paritySelect.disabled = freeText.disabled = !control;
+    $('ft-cq').disabled = !control || pending('ft_cq');
+    $('ft8-send').disabled = !control || pending('ft_free_text');
+    $('ft8-stop').disabled = !control || pending('ft_abort');
+    for (const input of stationInputs) {
+      input.disabled = !radio.connected || !state.available;
     }
+    const replyDisabled = !control || pending('ft_start_qso');
     for (const log of [ft8Log, ftOwnLog]) {
       for (const line of log.lines) {
-        if (line.tagName === 'BUTTON') line.disabled = !readyToStart;
+        if (line.tagName === 'BUTTON') line.disabled = replyDisabled;
       }
     }
     const qso = [state.peer, translate(stateLabels[state.state]),
       state.retries ? translate('Wiederholungen {count}', {count: state.retries}) : ''].filter(Boolean).join(' · ');
-    $('ft-contact').hidden = !qso;
+    $('ft-contact').hidden = !qso && !state.next_tx_ms;
     $('ft-qso-status').textContent = qso;
     const status = $('ft8-status');
-    const needsStation = active && (!state.callsign || !state.locator);
-    status.textContent = translate(error || (needsStation ? 'Rufzeichen und QTH-Locator eingeben und speichern.' :
-      state.sending ? 'Sendet …' : '')) ||
+    const needsStation = active && !state.configured;
+    status.textContent = translate(error || (state.sending ? 'Sendet …' : settingsDirty ? 'Speichert …' :
+      needsStation ? 'Für FT-TX Rufzeichen und QTH-Locator eingeben.' : '')) ||
       (outcome ? [outcome.peer, translate(outcome.text)].filter(Boolean).join(' · ') : '');
     status.classList.toggle('error', !!error);
     status.classList.toggle('sending', state.sending && !error);
   }
 
   function fillSettings() {
-    const saved = !!state.callsign;
+    const saved = state.configured;
     callInput.value = state.callsign || preferences.ftOwnCall || '';
     gridInput.value = state.locator || preferences.ftOwnGrid || '';
     offsetInput.value = saved ? state.tx_hz : Math.max(200, Math.min(Number(offsetInput.max), Number(preferences.ftAudioHz) || 1500));
@@ -325,9 +373,12 @@ export function createFtPanel({send, preferences, savePreferences}) {
       state = emptyState;
       active = false;
       clock = null;
-      settingsDirty = false;
+      clearTimeout(settingsTimer);
+      settingsTimer = null;
+      settingsDirty = settingsSubmitted = false;
       error = '';
       outcome = null;
+      fillSettings();
       clearFt8();
       clearWaterfall();
     }
@@ -341,20 +392,12 @@ export function createFtPanel({send, preferences, savePreferences}) {
 
   function handle(message) {
     switch (message.type) {
-      case 'ft-reply': {
-        const entry = requests.get(message.request_id);
-        if (!entry) return;
-        clearTimeout(entry.timeout);
-        requests.delete(message.request_id);
-        if (!message.ok) error = message.text || 'FT-Befehl fehlgeschlagen.';
-        else if (entry.op === 'ft_config') {
-          settingsDirty = false;
-          fillSettings();
-        }
-        break;
-      }
+      case 'ft-reply':
+        finishRequest(message.request_id, message.ok, message.text);
+        return;
       case 'ft-state': {
         const lastMode = state.mode;
+        if (state.receive_revision !== message.receive_revision) clearFt8();
         state = message;
         active = message.mode !== 'off';
         if (Number.isFinite(message.utc_ms)) clock = {utc: message.utc_ms, at: performance.now()};
@@ -373,6 +416,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
           paritySelect.replaceChildren(new Option(translate('Automatisch'), 'auto'), ...labels.map((label, index) => new Option(label, index)));
         }
         if (!settingsDirty) fillSettings();
+        restoreBrowserSettings();
         renderClock();
         break;
       }
@@ -439,22 +483,27 @@ export function createFtPanel({send, preferences, savePreferences}) {
   });
   modeSelect.onchange = () => request('ft_mode', {mode: modeSelect.value});
   settings.oninput = () => {
+    ++settingsRevision;
     settingsDirty = true;
     error = '';
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(() => {
+      settingsTimer = null;
+      saveSettings();
+    }, 1000);
     renderView();
   };
-  settings.onsubmit = event => {
-    event.preventDefault();
-    request('ft_config', {callsign: callInput.value, locator: gridInput.value,
-      tx_hz: offsetInput.valueAsNumber, tx_level: levelInput.valueAsNumber});
+  settings.onsubmit = event => event.preventDefault();
+  auto.onchange = () => {
+    const values = {auto: auto.value};
+    if (values.auto === 'off') request('ft_auto', values);
+    else requestTransmission('ft_auto', values);
   };
-  arm.onchange = () => request('ft_arm', {armed: arm.checked});
-  auto.onchange = () => request('ft_auto', {auto: auto.value});
-  $('ft-cq').onclick = () => request('ft_cq', paritySelect.value === 'auto' ? {} : {parity: +paritySelect.value});
+  $('ft-cq').onclick = () => requestTransmission('ft_cq', paritySelect.value === 'auto' ? {} : {parity: +paritySelect.value});
   $('ft8-stop').onclick = () => request('ft_abort');
   $('ft8-tx-form').onsubmit = event => {
     event.preventDefault();
-    request('ft_free_text', {text: freeText.value});
+    requestTransmission('ft_free_text', {text: freeText.value});
   };
   for (const input of requiredInputs) {
     input.addEventListener('input', () => input.setCustomValidity(''));
@@ -486,7 +535,7 @@ export function createFtPanel({send, preferences, savePreferences}) {
   setInterval(renderClock, 200);
 
   return {
-    update, handle, addFrame, languageChanged, active: () => active, busy: () => !!(state.armed || state.busy),
+    update, handle, addFrame, languageChanged, active: () => active, busy: () => state.busy || state.auto !== 'off',
     setStyle(lower, upper, color) { palette = waterfallColors(color, lower, upper); }
   };
 }

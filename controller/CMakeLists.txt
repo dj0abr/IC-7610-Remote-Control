@@ -40,7 +40,7 @@ endif()
 add_library(icom-lan STATIC icom-lan.cpp)
 target_compile_options(icom-lan PRIVATE -Wall -Wextra -Wpedantic)
 
-find_package(libft8 0.2.1 CONFIG REQUIRED HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../ft8/libft8/build/install")
+find_package(libft8 0.3.1 CONFIG REQUIRED HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../ft8/libft8/build/install")
 add_executable(kmcontrol-backend backend.cpp main-control.cpp spectrum.cpp ssb-demod.cpp
     rx-audio-filter.cpp rx-notch.cpp)
 target_link_libraries(kmcontrol-backend PRIVATE Qt5::Core Qt5::Network PkgConfig::FFTW LiquidDSP

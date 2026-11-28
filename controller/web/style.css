@@ -261,6 +261,9 @@ h1, h2 { margin: 0; }
 .setup-field { display: grid; gap: 5px; min-width: 0; }
 .setup-field input { font-family: var(--mono); }
 .setup-field input[aria-invalid="true"] { border-color: #ff9ca5; }
+#qrz-key-form { padding-top: 7px; border-top: 1px solid var(--border); }
+#qrz-key-status { color: var(--muted); }
+.qrz-key-actions { display: flex; flex-wrap: wrap; gap: 5px; }
 #ptt-mode-help { color: var(--muted); font-size: .74rem; }
 .setting-error { font-size: .74rem; }
 #browser-device-access { display: grid; justify-items: start; gap: 6px; }
@@ -382,7 +385,7 @@ button:not(:disabled):hover { border-color: var(--accent); }
   border-radius: 7px;
   background: var(--inset);
 }
-.ft-mode-toolbar label, .ft-qso .ft-arm { display: flex; align-items: center; gap: 6px; }
+.ft-mode-toolbar label { display: flex; align-items: center; gap: 6px; }
 .ft-mode-toolbar select { width: auto; }
 .ft-slot-meter, .ft-mode-options { flex-wrap: nowrap; }
 #ft-cq-only { margin: 0; accent-color: var(--accent); }
@@ -522,8 +525,6 @@ button.ft-decode-line:disabled { opacity: 1; }
   font: 11px var(--mono);
 }
 .ft-qso input:not([type="checkbox"]) { width: 94px; text-transform: uppercase; }
-.ft-arm { min-height: 26px; padding-inline: 5px; white-space: nowrap; }
-.ft-arm input { width: auto; margin: 0; accent-color: var(--accent); }
 .ft-controls .small-button { min-height: 26px; padding: 4px 8px; white-space: nowrap; }
 #ft8-send:enabled { background: #17434b; border-color: #508b96; color: #e6eef6; }
 #ft8-stop:enabled { border-color: #67424c; color: #ffd8de; }

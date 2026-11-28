@@ -119,7 +119,7 @@ bool isCommand(const QJsonObject& object)
         op == QStringLiteral("ptt") || op == QStringLiteral("rf_power") ||
         op == QStringLiteral("compressor") || op == QStringLiteral("preamp") ||
         op == QStringLiteral("ft_mode") || op == QStringLiteral("ft_config") ||
-        op == QStringLiteral("ft_arm") || op == QStringLiteral("ft_auto") || op == QStringLiteral("ft_cq") ||
+        op == QStringLiteral("ft_qrz_key") || op == QStringLiteral("ft_auto") || op == QStringLiteral("ft_cq") ||
         op == QStringLiteral("ft_start_qso") || op == QStringLiteral("ft_abort") || op == QStringLiteral("ft_free_text");
 }
 

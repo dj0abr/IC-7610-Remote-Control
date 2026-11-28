@@ -12,10 +12,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 Q_DECLARE_METATYPE(ft8::RadioReport)
 
@@ -31,7 +33,8 @@ public:
     void pttInput(quint64 session, quint32 id, const QString& action, bool latched);
     void txAudioInput(quint64 session, quint32 id, QByteArray pcm);
     void cancelPtt();
-    void scheduleDigitalTx(quint64 session, quint64 token, qint64 dialHz, ft8::Playback playback, int level);
+    void scheduleDigitalTx(quint64 session, quint64 token, qint64 dialHz, ft8::Playback playback);
+    void setFtTxLevel(int level) { m_ftTxLevel.store(level); }
     void cancelDigitalTx(quint64 id) { m_cancelDigitalId.store(id); }
 
 public slots:
@@ -88,8 +91,8 @@ private:
         ft8::Playback playback;
         Clock::time_point packetAt;
         Clock::time_point deadline;
-        QByteArray pcm;
-        int position = 0;
+        std::vector<float> pcm;
+        std::size_t position = 0;
         bool keyed = false;
         bool started = false;
     };
@@ -154,6 +157,7 @@ private:
     std::mutex m_txMutex;
     TxInput m_input;
     std::optional<DigitalTx> m_digitalTx;
+    std::atomic<int> m_ftTxLevel{25};
     std::atomic<quint64> m_cancelDigitalId{0};
     QString m_txPhase;
     QString m_txText;

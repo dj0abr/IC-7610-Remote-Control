@@ -19,7 +19,7 @@ if [[ -n $libft8_prefix ]]; then
 elif [[ -f $libft8_source/include/libft8/libft8.hpp ]]; then
     libft8_source=$(realpath -- "$libft8_source")
 else
-    printf '%s\n' 'Setze LIBFT8_SOURCE_DIR auf das libft8-Projekt oder LIBFT8_ROOT auf die installierte libft8 ab Version 0.2.1.' >&2
+    printf '%s\n' 'Setze LIBFT8_SOURCE_DIR auf das libft8-Projekt oder LIBFT8_ROOT auf die installierte libft8 ab Version 0.3.1.' >&2
     exit 1
 fi
 
